@@ -18,10 +18,11 @@ COPY pyproject.toml ./
 COPY src ./src
 
 # Build the project wheel *and* download all (including extra) dependencies
-# as wheels into /wheels. "uvicorn[standard]" brings uvloop/httptools, which
-# ship manylinux wheels for this base image.
-RUN pip install --no-cache-dir build \
-    && pip wheel --wheel-dir /wheels .
+# as wheels into /wheels. pip uses PEP 517 build isolation, so hatchling is
+# fetched automatically and no separate build tooling is needed.
+# "uvicorn[standard]" brings uvloop/httptools and "httpx[socks]" brings
+# socksio; all ship manylinux wheels for this base image.
+RUN pip wheel --wheel-dir /wheels .
 
 # ---------------------------------------------------------------------------
 # Runtime stage: minimal image, non-root user, the app installed from wheels.
@@ -61,6 +62,7 @@ LABEL org.opencontainers.image.source="https://github.com/stateless-hydra/statel
       org.opencontainers.image.description="Stateless, Kubernetes-native nzbhydra2/Newznab-compatible Usenet indexer proxy" \
       org.opencontainers.image.licenses=""
 
-# uvicorn is a project dependency; explicit host/port keep the container
-# self-contained regardless of the SH_HOST/SH_PORT environment values.
-CMD ["uvicorn", "stateless_hydra.main:app", "--host", "0.0.0.0", "--port", "5076"]
+# uvicorn is a project dependency. exec makes uvicorn PID 1 so it receives
+# SIGTERM directly; the SH_HOST/SH_PORT ENV defaults above (overridable by the
+# orchestrator) drive the bind address.
+CMD ["sh", "-c", "exec uvicorn stateless_hydra.main:app --host \"${SH_HOST:-0.0.0.0}\" --port \"${SH_PORT:-5076}\""]
