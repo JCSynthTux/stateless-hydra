@@ -1,0 +1,57 @@
+# stateless-hydra indexer definitions (example).
+#
+# In production this file is shipped as a Kubernetes ConfigMap
+# (see k8s/configmap-indexers.yaml) and mounted read-only at
+# /config/indexers.yaml. It contains NO secrets: each indexer only names the
+# API key it needs via `apiKeyRef`, which is resolved against the
+# api-keys.yaml Secret. Replace the fake values below with real indexers.
+#
+# An indexer entry supports these fields (defaults shown in comments):
+#   name             unique id used in logs, metrics and composed guids
+#   enabled          true | false                     (default: true)
+#   host             scheme + host, no trailing slash
+#   apiPath          API path on the indexer           (default: /api)
+#   apiKeyRef        key name looked up in api-keys.yaml
+#   apiHitLimit      daily search requests, 0=unlimited (default: 0)
+#   nzbPullLimit     daily NZB downloads, 0=unlimited   (default: 0)
+#   resetTime        daily reset as HH:MM 24h            (default: 00:00)
+#   resetTimezone    IANA timezone for resetTime         (default: UTC)
+#   timeoutSeconds   upstream request timeout            (default: 30.0)
+#   cacheTtlSeconds  per-indexer cache TTL; null=global default, <=0=disable
+#   searchTypes      subset of [search, tvsearch, movie, music, book]
+#   categories       list of Newznab category ids; omit for all
+#   proxyUrl         per-indexer proxy override; omit to use global_proxy_url
+
+indexers:
+  # Example 1: a Nexus/Newznab indexer with a realistic daily API-hit budget.
+  - name: example_indexer
+    enabled: true
+    host: "https://indexer.example.com"
+    apiPath: "/api"
+    apiKeyRef: "example_indexer_key"   # defined in api-keys.yaml
+    apiHitLimit: 1000                  # 0 = unlimited
+    nzbPullLimit: 100                  # 0 = unlimited
+    resetTime: "00:00"                 # reset at midnight in resetTimezone
+    resetTimezone: "UTC"
+    timeoutSeconds: 30
+    cacheTtlSeconds: 900               # null = use global cache_ttl_seconds
+    searchTypes: ["search", "tvsearch", "movie"]
+    categories: [2000, 5000]           # Movies and TV (omit for all)
+    # proxyUrl: "http://proxy.corp:3128"  # overrides global_proxy_url
+
+  # Example 2: a Torznab indexer with a different reset window and its own
+  # proxy, limited to TV and movie searches.
+  - name: example_torznab
+    enabled: false                     # disabled until configured
+    host: "https://torznab.example.org"
+    apiPath: "/api"
+    apiKeyRef: "example_torznab_key"
+    apiHitLimit: 0                     # unlimited
+    nzbPullLimit: 0                    # unlimited
+    resetTime: "06:00"                 # 06:00 local indexer time
+    resetTimezone: "America/New_York"
+    timeoutSeconds: 45
+    cacheTtlSeconds: 1800
+    searchTypes: ["tvsearch", "movie"]
+    # categories: [5000, 5040, 2000, 2040]
+    proxyUrl: "http://proxy.example.org:8080"

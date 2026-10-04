@@ -1,0 +1,22 @@
+# =============================================================================
+#  WARNING: THIS FILE CONTAINS SECRETS. NEVER COMMIT REAL KEYS.
+# =============================================================================
+# In production this file is a Kubernetes Secret (see
+# k8s/secret-api-keys.yaml) mounted read-only at /config/api-keys.yaml.
+# The checked-in copy uses CHANGE_ME placeholders only.
+#
+# Prefer a secret manager (External Secrets Operator, SOPS, Sealed Secrets)
+# over hand-editing a manifest; the checked-in manifest is a template.
+#
+#   apiKeys       name -> real indexer API key. The name is referenced by the
+#                 `apiKeyRef` field of an indexer in indexers.yaml.
+#   hydraApiKeys  the API keys clients (Sonarr, Radarr, ...) use to call
+#                 /api. At least one entry is required.
+# =============================================================================
+
+apiKeys:
+  example_indexer_key: "CHANGE_ME"
+  example_torznab_key: "CHANGE_ME"
+
+hydraApiKeys:
+  - "CHANGE_ME"

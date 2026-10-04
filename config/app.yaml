@@ -1,0 +1,58 @@
+# stateless-hydra application settings (example).
+#
+# In production this file is shipped as a Kubernetes ConfigMap
+# (see k8s/configmap-app.yaml) and mounted read-only at /config/app.yaml.
+# Every value below is the built-in default unless noted; delete a key to
+# fall back to the default. Environment variables prefixed with SH_ (for
+# example SH_REDIS_URL) always override values in this file.
+
+# Log verbosity: DEBUG, INFO, WARNING, ERROR or CRITICAL.
+# env: SH_LOG_LEVEL
+log_level: INFO
+
+# User-Agent sent to upstream indexers when an indexer does not override it.
+# Some indexers rate-limit or block unrecognized agents.
+# env: SH_USER_AGENT
+user_agent: "stateless-hydra/0.1.0"
+
+# Redis connection URL. All runtime state (search cache + daily limit
+# counters) lives here; the app itself stores nothing locally.
+# env: SH_REDIS_URL
+redis_url: "redis://localhost:6379/0"
+
+# Default cache TTL in seconds for indexer search responses. Individual
+# indexers can override this with `cacheTtlSeconds` in indexers.yaml.
+# Set to 0 to disable caching globally (or per indexer).
+# env: SH_CACHE_TTL_SECONDS
+cache_ttl_seconds: 900
+
+# When true, collapse results with identical titles across indexers,
+# keeping the highest-priority match. Useful to de-duplicate cross-posts.
+# env: SH_DEDUPE_BY_TITLE
+dedupe_by_title: false
+
+# Maximum number of results requested from each indexer per search.
+# env: SH_MAX_RESULTS_PER_INDEXER
+max_results_per_indexer: 100
+
+# Optional global HTTP(S) proxy for all upstream indexer requests, e.g.
+# "http://proxy.corp:3128" or "socks5://proxy.corp:1080". An indexer can
+# override this with `proxyUrl` in indexers.yaml. Leave unset for direct.
+# env: SH_GLOBAL_PROXY_URL
+global_proxy_url: null
+
+# Interface and port the HTTP server binds to (uvicorn). Port 5076 matches
+# nzbhydra2's default so existing *arr client configs keep working.
+# env: SH_HOST
+host: "0.0.0.0"
+# env: SH_PORT
+port: 5076
+
+# Paths to the two other config files. Set by the container defaults / k8s
+# mounts; you normally do not need to change these here.
+# env: SH_APP_CONFIG
+app_config: "/config/app.yaml"
+# env: SH_INDEXERS_FILE
+indexers_file: "/config/indexers.yaml"
+# env: SH_API_KEYS_FILE
+api_keys_file: "/config/api-keys.yaml"
