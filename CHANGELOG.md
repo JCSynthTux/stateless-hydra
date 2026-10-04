@@ -1,6 +1,81 @@
 # CHANGELOG
 
 
+## v0.1.1 (2026-10-04)
+
+### Bug Fixes
+
+- **api**: Quiet readiness logging and add redis connection timeouts
+  ([`2c30cec`](https://github.com/JCSynthTux/stateless-hydra/commit/2c30cecaad9e399f699bb021a2e0211ca365031c))
+
+Log a single concise WARNING line per /readyz failure (with the exception message) instead of a full
+  traceback on every probe cycle; the traceback is still available via logger.debug(...,
+  exc_info=True).
+
+Construct the app-owned redis.asyncio client with socket_connect_timeout=3.0 and socket_timeout=5.0
+  so a misconfigured/unreachable Redis fails fast rather than hanging the readiness probe. Injected
+  clients are passed through untouched, so tests keep their behavior.
+
+- **deploy**: Stop overriding ConfigMap redis_url via image and deployment env
+  ([`c40498c`](https://github.com/JCSynthTux/stateless-hydra/commit/c40498c96a00932fe9ba36503dd97e94af67ce9b))
+
+The Docker image baked SH_REDIS_URL=redis://redis:6379/0 and the k8s Deployment set the same env
+  var. Because SH_* env vars always override the config file, a user editing redis_url in the app
+  ConfigMap still connected to redis:6379, failing readiness with 'Name or service not known'.
+
+Remove the baked ENV default and the Deployment env block so the mounted app.yaml ConfigMap is the
+  single source of truth for redis_url in k8s. docker-compose keeps its own SH_REDIS_URL
+  (self-consistent with its redis service). Update the related comments in configmap-app.yaml,
+  config/app.yaml and redis.yaml to point at the ConfigMap, noting SH_* env remains an override.
+
+### Build System
+
+- **deps**: Bump docker/login-action from 3 to 4
+  ([`2ee62e9`](https://github.com/JCSynthTux/stateless-hydra/commit/2ee62e94605b0647463e1b240f4e7e7e7e57223a))
+
+Bumps [docker/login-action](https://github.com/docker/login-action) from 3 to 4. - [Release
+  notes](https://github.com/docker/login-action/releases) -
+  [Commits](https://github.com/docker/login-action/compare/v3...v4)
+
+--- updated-dependencies: - dependency-name: docker/login-action dependency-version: '4'
+
+dependency-type: direct:production
+
+update-type: version-update:semver-major ...
+
+Signed-off-by: dependabot[bot] <support@github.com>
+
+- **deps**: Bump docker/metadata-action from 5 to 6
+  ([`f0aeb34`](https://github.com/JCSynthTux/stateless-hydra/commit/f0aeb34db57929e62e0caba4bc08b0ee598746a5))
+
+Bumps [docker/metadata-action](https://github.com/docker/metadata-action) from 5 to 6. - [Release
+  notes](https://github.com/docker/metadata-action/releases) -
+  [Commits](https://github.com/docker/metadata-action/compare/v5...v6)
+
+--- updated-dependencies: - dependency-name: docker/metadata-action dependency-version: '6'
+
+dependency-type: direct:production
+
+update-type: version-update:semver-major ...
+
+Signed-off-by: dependabot[bot] <support@github.com>
+
+### Chores
+
+- Ignore GitHub token file
+  ([`8f614e1`](https://github.com/JCSynthTux/stateless-hydra/commit/8f614e10a221fd2d836d93f78175b3a765a8b7fc))
+
+### Documentation
+
+- Add redis connectivity troubleshooting and prefer ConfigMap over env
+  ([`6a83076`](https://github.com/JCSynthTux/stateless-hydra/commit/6a83076da1b38fcf7d26ec7f26c1f94dc9398c70))
+
+Document that /readyz returning 503 with 'Name or service not known' means the app cannot reach
+  Redis: check that redis_url in the app ConfigMap matches the Redis Service DNS name, and remember
+  SH_* env vars override the config file. Point Kubernetes users at the ConfigMap redis_url instead
+  of SH_REDIS_URL.
+
+
 ## v0.1.0 (2026-10-04)
 
 ### Bug Fixes
