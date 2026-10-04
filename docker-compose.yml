@@ -1,0 +1,34 @@
+# Local development stack for stateless-hydra.
+#
+# The app is stateless: Redis holds only cache entries and the per-indexer
+# daily limit counters, so it is started without persistence (no volume).
+# Config files are bind-mounted read-only from ./config (see config/ for
+# commented examples). Copy/edit those files before `docker compose up`.
+#
+# No `version:` key: the Compose Specification is used by modern Docker.
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    # No persistence by design: everything in Redis is reconstructible
+    # (cache) or resets daily (limit counters).
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  app:
+    build: .
+    ports:
+      - "5076:5076"
+    environment:
+      SH_REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./config:/config:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped

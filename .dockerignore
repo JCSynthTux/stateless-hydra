@@ -1,0 +1,30 @@
+# Version control and local environments
+.git
+.gitignore
+.github
+.venv
+.env
+
+# Python build/test artifacts
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+dist
+build
+.pytest_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# Not needed inside the image: the wheel is built from pyproject.toml
+uv.lock
+tests
+
+# Local/dev-only material copied into the image at runtime by orchestration
+config
+k8s
+docker-compose.yml
+
+# Docs
+README.md
