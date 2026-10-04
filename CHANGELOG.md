@@ -1,6 +1,35 @@
 # CHANGELOG
 
 
+## v0.1.2 (2026-10-04)
+
+### Bug Fixes
+
+- **newznab**: Render nzb enclosure so AIOStreams keeps search results
+  ([`1f071ad`](https://github.com/JCSynthTux/stateless-hydra/commit/1f071ad5405a07ce7b5fb9c84959b8282552e436))
+
+AIOStreams' newznab integration builds the NZB URL from the item's <enclosure> and silently drops
+  every item that lacks one whose type contains "nzb"; its scanner also never drops items for any
+  other reason. nzbhydra2 always emits an enclosure, so a real nzbhydra2 endpoint works while our
+  feed parsed to zero streams despite a correct totalResults.
+
+Add ResultItem.enclosure_url and render <enclosure url=... length=... type="application/x-nzb"/>
+  when set. Search items now advertise our own /api?t=getnzb&id=<composed guid>&apikey=<caller key>
+  as both <link> and the enclosure, matching nzbhydra2 and keeping downloads routed through the
+  limit tracker instead of leaking the upstream indexer key via <link>.
+
+The parser reads <enclosure url> back so render->parse round-trips hold.
+
+### Documentation
+
+- **deploy**: Correct ConfigMap header comment about env precedence
+  ([`355ffa4`](https://github.com/JCSynthTux/stateless-hydra/commit/355ffa40fc61b70bad3e37234938155b4ebf61d7))
+
+The header claimed SH_* env vars are how the Deployment points redis_url at the in-cluster Service.
+  The Deployment deliberately sets no SH_REDIS_URL now, so the ConfigMap is authoritative; only note
+  the standard SH_* override precedence and that redis_url should be edited here.
+
+
 ## v0.1.1 (2026-10-04)
 
 ### Bug Fixes
