@@ -53,6 +53,8 @@ def create_app(
     windows in tests.
     """
     settings = settings or load_settings(None)
+    # force=False: never clobber an existing (uvicorn/pytest) logging setup when
+    # the app factory runs. ``python -m stateless_hydra`` forces explicitly.
     setup_logging(settings)
 
     indexer_list = load_indexers(settings.indexers_file)

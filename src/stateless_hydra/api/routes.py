@@ -66,6 +66,9 @@ _SEARCH_PARAMS = (
     "ep",
     "artist",
     "album",
+    "track",
+    "label",
+    "year",
     "author",
     "title",
     "genre",
@@ -108,16 +111,35 @@ def _pub_date_key(pair: tuple[str, ResultItem]) -> datetime:
 def _dedupe_by_title(
     ordered: list[tuple[str, ResultItem]],
 ) -> list[tuple[str, ResultItem]]:
-    """Drop later duplicates sharing a title (case-insensitive)."""
+    """Drop later duplicates sharing a non-empty title (case-insensitive).
+
+    Items with an empty title are always kept: an empty title carries no
+    identity, so collapsing them would silently discard unrelated results.
+    """
     seen: set[str] = set()
     deduped: list[tuple[str, ResultItem]] = []
     for pair in ordered:
-        title = pair[1].title.lower()
+        title = (pair[1].title or "").strip().lower()
+        if not title:
+            deduped.append(pair)
+            continue
         if title in seen:
             continue
         seen.add(title)
         deduped.append(pair)
     return deduped
+
+
+def _enabled_owner(request: Request, indexer_name: str) -> bool:
+    """Whether ``indexer_name`` exists and is enabled.
+
+    Clients are built for every configured indexer (so configuration errors
+    surface at startup), which means ``app.state.clients`` alone would allow a
+    composed guid to reach a disabled indexer. Details/getnzb must therefore
+    check the owning :class:`IndexerConfig` as well.
+    """
+    indexer = request.app.state.indexers.get(indexer_name)
+    return indexer is not None and indexer.enabled
 
 
 async def _update_limit_gauge(request: Request, indexer: str, kind: LimitKind) -> None:
@@ -193,11 +215,13 @@ async def _query_indexers(
             error_skips += 1
             continue
 
-        await app.state.cache.set(name, key, text, indexer.cache_ttl_seconds)
+        # Parse before caching: a malformed response must not be cached and
+        # re-served as a permanent error on every subsequent search.
         parsed = _parse_or_none(name, text, metrics)
         if parsed is None:
             error_skips += 1
             continue
+        await app.state.cache.set(name, key, text, indexer.cache_ttl_seconds)
         results_obtained = True
         merged.extend((name, item) for item in parsed.items)
 
@@ -223,6 +247,16 @@ async def _handle_search(request: Request, function: str, o: str) -> Response:
 
     offset = _parse_non_negative(query.get("offset", "0"), "offset")
     limit = _parse_non_negative(query.get("limit", "100"), "limit")
+
+    # A zero limit asks for no results; answer immediately rather than querying
+    # indexers for data that would only be sliced away.
+    if limit == 0:
+        metrics.inc_search(function)
+        start = time.monotonic()
+        try:
+            return _render(render_results([], 0, 0, o), o)
+        finally:
+            metrics.observe_search_duration(function, time.monotonic() - start)
 
     forwarded: dict[str, str] = {}
     for key, value in query.multi_items():
@@ -270,7 +304,7 @@ async def _handle_details(request: Request) -> Response:
     if split is None:
         raise NewznabError(300, "No such item")
     indexer_name, original_guid = split
-    if indexer_name not in app.state.clients:
+    if not _enabled_owner(request, indexer_name):
         raise NewznabError(300, "No such item")
     client = app.state.clients[indexer_name]
 
@@ -282,12 +316,15 @@ async def _handle_details(request: Request) -> Response:
     metrics.inc_api_hit(indexer_name)
 
     try:
-        text = await client.search({"t": "details", "id": original_guid})
+        response = await client.fetch(client.build_url({"t": "details", "id": original_guid}))
     except IndexerError:
         logger.warning("indexer %s details failed", indexer_name, exc_info=True)
         metrics.inc_error(indexer_name)
         raise NewznabError(900) from None
-    return Response(content=text, media_type=XML_MEDIA_TYPE)
+
+    if response.status_code >= 400:
+        raise NewznabError(300 if response.status_code == 404 else 900)
+    return Response(content=response.content, media_type=XML_MEDIA_TYPE)
 
 
 async def _handle_getnzb(request: Request) -> Response:
@@ -301,16 +338,16 @@ async def _handle_getnzb(request: Request) -> Response:
     if split is None:
         raise NewznabError(300, "No such item")
     indexer_name, original_guid = split
-    if indexer_name not in app.state.clients:
+    if not _enabled_owner(request, indexer_name):
         raise NewznabError(300, "No such item")
     client = app.state.clients[indexer_name]
 
     allowed = await app.state.limits.consume(indexer_name, LimitKind.NZB)
+    await _update_limit_gauge(request, indexer_name, LimitKind.NZB)
     if not allowed:
         metrics.inc_limit_reached(indexer_name, LimitKind.NZB.value)
         raise NewznabError(930)
     metrics.inc_nzb_pull(indexer_name)
-    await _update_limit_gauge(request, indexer_name, LimitKind.NZB)
 
     try:
         response = await client.fetch(client.build_url({"t": "getnzb", "id": original_guid}))

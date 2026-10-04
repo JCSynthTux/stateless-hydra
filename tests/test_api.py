@@ -128,6 +128,20 @@ def test_search_aggregates_both_indexers_and_sorts_by_pubdate(client, sample_rss
 
 
 @respx.mock
+def test_search_skips_disabled_indexer(client, sample_rss):
+    respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+    respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
+    ghost = respx.get("https://ghost.example.com/api").mock(
+        return_value=httpx.Response(200, text=sample_rss)
+    )
+
+    response = client.get(API, params={"t": "search", "q": "ubuntu", "apikey": KEY})
+
+    assert len(_items(response.text)) == 4
+    assert ghost.call_count == 0
+
+
+@respx.mock
 def test_search_limit_slices_items_but_keeps_total(client, sample_rss):
     respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
     respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
@@ -169,6 +183,74 @@ def test_bad_offset_yields_201(client):
     assert 'code="201"' in response.text
 
 
+@respx.mock
+def test_limit_zero_returns_empty_result_without_upstream(client, sample_rss):
+    geek = respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+    slug = respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
+
+    response = client.get(API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "limit": "0"})
+
+    assert response.status_code == 200
+    assert _items(response.text) == []
+    assert _response_total(response.text) == "0"
+    assert geek.call_count == 0
+    assert slug.call_count == 0
+
+
+@respx.mock
+def test_music_track_is_a_valid_search_param_and_is_forwarded(client, sample_rss):
+    geek = respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+    respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
+
+    response = client.get(API, params={"t": "music", "track": "mysong", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert "Missing query parameter" not in response.text
+    assert _items(response.text)
+    assert geek.calls[0].request.url.params.get("track") == "mysong"
+
+
+@respx.mock
+def test_upstream_limit_is_capped_by_max_results_per_indexer(client, sample_rss):
+    geek = respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+    respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
+
+    client.get(API, params={"t": "search", "q": "ubuntu", "apikey": KEY})
+
+    assert geek.calls[0].request.url.params.get("limit") == "10"
+
+
+@respx.mock
+def test_offset_slices_items_but_keeps_total(client, sample_rss):
+    respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+    respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
+
+    response = client.get(
+        API,
+        params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek", "offset": "1"},
+    )
+
+    assert len(_items(response.text)) == 1
+    assert _response_total(response.text) == "2"
+    assert _guids(response.text) == ["nzbgeek:guid-two"]
+
+
+@respx.mock
+def test_no_eligible_indexer_yields_203(client, sample_rss):
+    # Filtering to the disabled "ghost" indexer leaves no eligible indexer.
+    ghost = respx.get("https://ghost.example.com/api").mock(
+        return_value=httpx.Response(200, text=sample_rss)
+    )
+
+    response = client.get(
+        API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "ghost"}
+    )
+
+    assert response.status_code == 200
+    assert 'code="203"' in response.text
+    assert ghost.call_count == 0
+
+
 # --- caching -----------------------------------------------------------------
 
 
@@ -195,6 +277,21 @@ def test_different_query_is_a_cache_miss(client, sample_rss):
     client.get(API, params={"t": "search", "q": "ubuntu", "apikey": KEY})
     client.get(API, params={"t": "search", "q": "debian", "apikey": KEY})
 
+    assert geek.call_count == 2
+
+
+@respx.mock
+def test_malformed_upstream_response_is_not_cached(client, sample_rss):
+    geek = respx.get(GEEK).mock(return_value=httpx.Response(200, text="<rss><channel>"))
+    respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
+
+    params = {"t": "search", "q": "ubuntu", "apikey": KEY}
+    first = client.get(API, params=params)
+    second = client.get(API, params=params)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    # The malformed payload must not be cached: the second search re-queries it.
     assert geek.call_count == 2
 
 
@@ -259,6 +356,26 @@ def test_getnzb_bad_guid_yields_300(client):
     assert 'code="300"' in response.text
 
 
+@respx.mock
+def test_getnzb_disabled_indexer_yields_300_without_upstream(client):
+    ghost = respx.get("https://ghost.example.com/api").mock(
+        return_value=httpx.Response(200, content=b"should-not-be-served")
+    )
+
+    response = client.get(API, params={"t": "getnzb", "id": "ghost:xyz", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert 'code="300"' in response.text
+    assert ghost.call_count == 0
+
+
+def test_getnzb_missing_id_yields_200(client):
+    response = client.get(API, params={"t": "getnzb", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert 'code="200"' in response.text
+
+
 # --- details -----------------------------------------------------------------
 
 
@@ -280,10 +397,42 @@ def test_details_is_proxied_verbatim(client):
 
 
 def test_details_unknown_indexer_yields_300(client):
+    response = client.get(API, params={"t": "details", "id": "nonexistent:xyz", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert 'code="300"' in response.text
+
+
+@respx.mock
+def test_details_disabled_indexer_yields_300_without_upstream(client):
+    ghost = respx.get("https://ghost.example.com/api").mock(
+        return_value=httpx.Response(200, text="<rss/>")
+    )
+
     response = client.get(API, params={"t": "details", "id": "ghost:xyz", "apikey": KEY})
 
     assert response.status_code == 200
     assert 'code="300"' in response.text
+    assert ghost.call_count == 0
+
+
+@respx.mock
+def test_details_404_yields_300(client):
+    respx.get(GEEK, params={"t": "details", "id": "xyz"}).mock(
+        return_value=httpx.Response(404, text="gone")
+    )
+
+    response = client.get(API, params={"t": "details", "id": "nzbgeek:xyz", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert 'code="300"' in response.text
+
+
+def test_details_missing_id_yields_200(client):
+    response = client.get(API, params={"t": "details", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert 'code="200"' in response.text
 
 
 # --- upstream errors ---------------------------------------------------------
@@ -328,6 +477,32 @@ def test_dedupe_by_title_drops_cross_indexer_duplicates(settings, fake_redis, sa
 
     assert len(_items(response.text)) == 2
     assert _response_total(response.text) == "2"
+
+
+@respx.mock
+def test_dedupe_keeps_items_with_empty_titles(settings, fake_redis):
+    dedupe_settings = settings.model_copy(update={"dedupe_by_title": True})
+    dedupe_app = create_app(dedupe_settings, redis_client=fake_redis)
+    empty_title_feed = (
+        '<rss xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/">'
+        '<channel><newznab:response offset="0" total="2"/>'
+        '<item><title></title><guid isPermaLink="false">e1</guid>'
+        "<link>https://example.com/e1</link>"
+        "<pubDate>Mon, 02 Oct 2023 12:00:00 GMT</pubDate><category>5040</category></item>"
+        '<item><title></title><guid isPermaLink="false">e2</guid>'
+        "<link>https://example.com/e2</link>"
+        "<pubDate>Sun, 01 Oct 2023 12:00:00 GMT</pubDate><category>5040</category></item>"
+        "</channel></rss>"
+    )
+    respx.get(GEEK).mock(return_value=httpx.Response(200, text=empty_title_feed))
+    respx.get(SLUG).mock(return_value=httpx.Response(200, text=empty_title_feed))
+
+    with TestClient(dedupe_app) as dedupe_client:
+        response = dedupe_client.get(API, params={"t": "search", "q": "ubuntu", "apikey": KEY})
+
+    # Empty titles carry no identity: all four items (two per indexer) survive.
+    assert len(_items(response.text)) == 4
+    assert _response_total(response.text) == "4"
 
 
 # --- metrics and probes ------------------------------------------------------

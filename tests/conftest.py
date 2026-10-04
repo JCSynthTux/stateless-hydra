@@ -32,12 +32,19 @@ indexers:
     apiHitLimit: 0
     nzbPullLimit: 0
     searchTypes: [search]
+  - name: ghost
+    enabled: false
+    host: https://ghost.example.com
+    apiPath: /api
+    apiKeyRef: ghost_key
+    searchTypes: [search]
 """
 
 API_KEYS_YAML = """
 apiKeys:
   geek_key: geek-secret
   slug_key: slug-secret
+  ghost_key: ghost-secret
 hydraApiKeys:
   - test-key
 """

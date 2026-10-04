@@ -15,7 +15,7 @@ from .config import load_settings, setup_logging
 def main() -> None:
     """Load settings and run the ASGI app with uvicorn."""
     settings = load_settings(None)
-    setup_logging(settings)
+    setup_logging(settings, force=True)
     uvicorn.run(
         "stateless_hydra.main:app",
         host=settings.host,

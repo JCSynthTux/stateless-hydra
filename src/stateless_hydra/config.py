@@ -211,8 +211,13 @@ def resolve_indexer_key(indexer: IndexerConfig, api_keys: ApiKeysFile) -> str:
         ) from exc
 
 
-def setup_logging(settings: AppSettings) -> None:
+def setup_logging(settings: AppSettings, *, force: bool = False) -> None:
     """Configure stdlib logging to stderr at ``settings.log_level``.
+
+    ``force`` is passed through to :func:`logging.basicConfig`. It defaults to
+    ``False`` so that importing/building the app never clobbers an existing
+    logging configuration (uvicorn or pytest); process-owning entry points such
+    as ``python -m stateless_hydra`` may opt into forcing.
 
     ``httpx``/``httpcore`` are pinned to ``WARNING``: at ``INFO`` httpx logs the
     full request URL, which would leak upstream indexer API keys into the logs.
@@ -221,7 +226,7 @@ def setup_logging(settings: AppSettings) -> None:
         level=settings.log_level.upper(),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         stream=sys.stderr,
-        force=True,
+        force=force,
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
