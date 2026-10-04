@@ -2,8 +2,10 @@
 # Non-secret configuration lives in a ConfigMap (AGENTS.md rule 2: only
 # credentials belong in a Secret; this file has none).
 #
-# SH_* environment variables on the container override these values, which
-# is how the Deployment points redis_url at the in-cluster Service.
+# SH_* environment variables set on the container override these values
+# (standard precedence), but for redis_url prefer editing this file — the
+# Deployment deliberately sets no SH_REDIS_URL, so this ConfigMap is
+# authoritative.
 apiVersion: v1
 kind: ConfigMap
 metadata:
