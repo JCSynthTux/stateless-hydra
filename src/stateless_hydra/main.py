@@ -74,7 +74,15 @@ def create_app(
     }
 
     owns_redis = redis_client is None
-    redis = redis_client if redis_client is not None else redis_asyncio.from_url(settings.redis_url)
+    redis = (
+        redis_client
+        if redis_client is not None
+        else redis_asyncio.from_url(
+            settings.redis_url,
+            socket_connect_timeout=3.0,
+            socket_timeout=5.0,
+        )
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):

@@ -404,8 +404,10 @@ async def readyz(request: Request) -> Response:
     """Readiness probe: ready only when Redis is reachable."""
     try:
         await request.app.state.redis.ping()
-    except Exception:
-        logger.warning("readiness check failed", exc_info=True)
+    except Exception as exc:
+        # One concise line per probe cycle; full traceback only at DEBUG.
+        logger.warning("readiness check failed: %s", exc)
+        logger.debug("readiness check failed", exc_info=True)
         return JSONResponse(content={"status": "not ready"}, status_code=503)
     return JSONResponse(content={"status": "ready"})
 
