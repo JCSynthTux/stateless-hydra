@@ -1,0 +1,418 @@
+"""Tests for the pure Newznab/Torznab protocol module.
+
+Nothing here touches the network or Redis: every function under test works on
+in-memory strings and dataclasses. Fixtures live in this file because
+``tests/conftest.py`` is owned by a later task.
+"""
+
+import pytest
+from lxml import etree
+
+from stateless_hydra.newznab import (
+    CATEGORIES,
+    ERROR_CODES,
+    NewznabError,
+    ResultItem,
+    canonical_query,
+    compose_guid,
+    parse_indexer_rss,
+    render_caps,
+    render_error,
+    render_results,
+    split_guid,
+)
+
+_NEWZNAB_NS = "http://www.newznab.com/DTD/2010/feeds/attributes/"
+_TORZNAB_NS = "http://torznab.com/schemas/2015/feed"
+
+
+def _parse(xml_text: str) -> etree._Element:
+    return etree.fromstring(xml_text.encode("utf-8"))
+
+
+SAMPLE_RSS = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+     xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/"
+     xmlns:torznab="http://torznab.com/schemas/2015/feed">
+  <channel>
+    <title>Example Indexer</title>
+    <newznab:response offset="25" total="1234"/>
+    <item>
+      <title>Some.Release.1080p.WEB-DL</title>
+      <guid isPermaLink="false">abc123</guid>
+      <link>https://indexer.invalid/getnzb/abc123.nzb</link>
+      <pubDate>Sun, 04 Oct 2026 12:00:00 +0000</pubDate>
+      <category>5040</category>
+      <size>1073741824</size>
+      <description>A very nice release</description>
+      <torznab:attr name="seeders" value="42"/>
+      <torznab:attr name="peers" value="50"/>
+      <newznab:attr name="imdb" value="tt1234567"/>
+    </item>
+    <item>
+      <title>No.Frills.Release</title>
+      <guid isPermaLink="false">def456</guid>
+      <link>https://indexer.invalid/getnzb/def456.nzb</link>
+      <pubDate>Sun, 04 Oct 2026 13:00:00 +0000</pubDate>
+      <category>2000 2040</category>
+      <size>not-a-number</size>
+      <torznab:attr name="seeders" value="5"/>
+    </item>
+  </channel>
+</rss>
+"""
+
+
+# --- error codes and NewznabError -------------------------------------------
+
+
+def test_error_codes_contain_910_and_930_with_exact_descriptions():
+    assert ERROR_CODES[910] == "API hit limit reached"
+    assert ERROR_CODES[930] == "Download limit reached"
+
+
+def test_newznab_error_known_code_uses_table_description():
+    error = NewznabError(201)
+
+    assert error.code == 201
+    assert error.description == "Incorrect parameter"
+    assert error.args[0] == "201: Incorrect parameter"
+
+
+def test_newznab_error_unknown_code_falls_back_to_900():
+    error = NewznabError(12345)
+
+    assert error.code == 900
+    assert error.description == "Unknown error"
+
+
+def test_newznab_error_custom_description_is_kept():
+    error = NewznabError(100, "nope")
+
+    assert error.code == 100
+    assert error.description == "nope"
+
+
+# --- render_error -----------------------------------------------------------
+
+
+def test_render_error_known_code_exact_string():
+    assert render_error(910) == '<error code="910" description="API hit limit reached"/>\n'
+
+
+def test_render_error_custom_description_exact_string():
+    assert render_error(100, "bad key") == '<error code="100" description="bad key"/>\n'
+
+
+def test_render_error_escapes_description():
+    rendered = render_error(300, 'a & "b" <c>')
+
+    assert rendered == '<error code="300" description="a &amp; &quot;b&quot; &lt;c&gt;"/>\n'
+    _parse(rendered)  # still well-formed
+
+
+# --- render_caps ------------------------------------------------------------
+
+
+def test_render_caps_xml_is_well_formed_with_expected_structure():
+    xml = render_caps({"search", "tvsearch", "movie", "music", "book"})
+    root = _parse(xml)
+
+    assert root.tag == "caps"
+    server = root.find("server")
+    assert server is not None
+    assert server.get("appversion") == "0.1.0"
+    assert server.get("version") == "2.0"
+    assert server.get("title") == "stateless-hydra"
+    assert server.get("strapline") == "stateless-hydra"
+    assert root.find("searching") is not None
+    assert root.find("categories") is not None
+
+
+def test_render_caps_only_advertises_requested_search_types():
+    xml = render_caps({"search", "tvsearch"})
+    root = _parse(xml)
+    searching = root.find("searching")
+
+    assert searching is not None
+    tags = [child.tag for child in searching]
+    assert tags == ["search", "tv-search"]
+    assert searching.find("search").get("supportedParams") == "q"
+    assert searching.find("tv-search").get("supportedParams") == "q,season,ep"
+    assert searching.find("movie-search") is None
+    assert searching.find("music-search") is None
+    assert searching.find("book-search") is None
+
+
+def test_render_caps_categories_are_nested_parents_and_subcats():
+    root = _parse(render_caps({"search"}, o="xml"))
+    categories = root.find("categories")
+
+    tv = categories.find("category[@id='5000']")
+    assert tv is not None
+    assert tv.get("name") == "TV"
+    assert tv.find("subcat[@id='5040']").get("name") == "TV/HD"
+
+    movies = categories.find("category[@id='2000']")
+    assert movies.get("name") == "Movies"
+    assert movies.find("subcat[@id='2040']").get("name") == "Movies/HD"
+
+
+def test_categories_table_has_required_entries():
+    assert CATEGORIES[5000] == "TV"
+    assert CATEGORIES[5040] == "TV/HD"
+    assert CATEGORIES[2000] == "Movies"
+    assert CATEGORIES[2040] == "Movies/HD"
+    assert CATEGORIES[2030] == "Movies/SD"
+    assert CATEGORIES[2060] == "Movies/3D"
+    assert CATEGORIES[5060] == "TV/Sport"
+    assert CATEGORIES[7020] == "Other/E-Book"
+    # Parents are ids divisible by 1000 and there is a subcat for each.
+    assert {cid for cid in CATEGORIES if cid % 1000 == 0} == {
+        1000,
+        2000,
+        3000,
+        4000,
+        5000,
+        6000,
+        7000,
+    }
+
+
+def test_render_caps_json_exact_shape():
+    caps = render_caps({"search", "tvsearch"}, o="json")
+
+    assert set(caps) == {"caps"}
+    assert caps["caps"]["server"] == {
+        "appversion": "0.1.0",
+        "version": "2.0",
+        "title": "stateless-hydra",
+        "strapline": "stateless-hydra",
+    }
+    assert list(caps["caps"]["searching"]) == ["search", "tv-search"]
+    assert caps["caps"]["searching"]["search"] == {
+        "available": "yes",
+        "supportedParams": "q",
+    }
+    assert caps["caps"]["searching"]["tv-search"] == {
+        "available": "yes",
+        "supportedParams": "q,season,ep",
+    }
+
+    tv = next(c for c in caps["caps"]["categories"] if c["id"] == "5000")
+    assert set(tv) == {"id", "name", "subcat"}
+    assert tv["name"] == "TV"
+    assert {"id": "5040", "name": "TV/HD"} in tv["subcat"]
+
+
+# --- render_results ---------------------------------------------------------
+
+
+def _sample_item(**overrides) -> ResultItem:
+    base = {
+        "title": "Some.Release.1080p",
+        "guid": "ix:abc123",
+        "link": "https://indexer.invalid/getnzb/abc123.nzb",
+        "pub_date": "Sun, 04 Oct 2026 12:00:00 +0000",
+        "category": "5040",
+        "size": 1073741824,
+        "description": "A very nice release",
+        "attributes": {"seeders": "42", "imdb": "tt1234567"},
+    }
+    base.update(overrides)
+    return ResultItem(**base)
+
+
+def test_render_results_xml_namespaces_response_and_item():
+    item = _sample_item()
+    xml = render_results([item], total=2, offset=1)
+    root = _parse(xml)
+
+    assert root.tag == "rss"
+    assert root.get("version") == "2.0"
+    assert set(root.nsmap) == {"atom", "newznab", "torznab"}
+
+    response = root.find(f".//{{{_NEWZNAB_NS}}}response")
+    assert response is not None
+    assert response.get("offset") == "1"
+    assert response.get("total") == "2"
+
+    channel = root.find("channel")
+    assert channel.findtext("title") == "stateless-hydra"
+    assert channel.findtext("description") == "stateless-hydra aggregated results"
+    assert channel.findtext("language") == "en-us"
+    assert channel.findtext("webMaster") == "admin@stateless-hydra.invalid"
+    assert channel.findtext("category") == "search"
+
+    item_el = root.find(".//item")
+    assert item_el.findtext("title") == item.title
+    guid_el = item_el.find("guid")
+    assert guid_el.text == item.guid
+    assert guid_el.get("isPermaLink") == "false"
+    assert item_el.findtext("link") == item.link
+    assert item_el.findtext("pubDate") == item.pub_date
+    assert item_el.findtext("category") == item.category
+    assert item_el.findtext("size") == str(item.size)
+    assert item_el.findtext("description") == item.description
+
+    attrs = {el.get("name"): el.get("value") for el in item_el.findall(f"{{{_TORZNAB_NS}}}attr")}
+    assert attrs == item.attributes
+
+
+def test_render_results_round_trips_through_parser():
+    item = _sample_item()
+    xml = render_results([item], total=1, offset=0)
+
+    parsed = parse_indexer_rss(xml)
+
+    assert parsed.total == 1
+    assert parsed.offset == 0
+    assert parsed.items == [item]
+
+
+def test_render_results_omits_size_when_none():
+    item = _sample_item(size=None, description=None)
+    root = _parse(render_results([item], total=1, offset=0))
+
+    assert root.find(".//item/size") is None
+    assert parse_indexer_rss(render_results([item], total=1, offset=0)).items == [item]
+
+
+def test_render_results_json_exact_shape():
+    item = _sample_item()
+    out = render_results([item], total=2, offset=1, o="json")
+
+    assert set(out) == {"results"}
+    channel = out["results"]["channel"]
+    assert set(channel) == {"items", "offset", "total"}
+    assert channel["offset"] == 1
+    assert channel["total"] == 2
+    assert channel["items"] == [
+        {
+            "title": item.title,
+            "guid": item.guid,
+            "link": item.link,
+            "pubDate": item.pub_date,
+            "category": item.category,
+            "size": item.size,
+            "description": item.description,
+            "attributes": item.attributes,
+        }
+    ]
+
+
+# --- parse_indexer_rss ------------------------------------------------------
+
+
+def test_parse_indexer_rss_reads_response_and_items():
+    parsed = parse_indexer_rss(SAMPLE_RSS)
+
+    assert parsed.total == 1234
+    assert parsed.offset == 25
+    assert len(parsed.items) == 2
+
+    first = parsed.items[0]
+    assert first.title == "Some.Release.1080p.WEB-DL"
+    assert first.guid == "abc123"
+    assert first.link == "https://indexer.invalid/getnzb/abc123.nzb"
+    assert first.pub_date == "Sun, 04 Oct 2026 12:00:00 +0000"
+    assert first.category == "5040"
+    assert first.size == 1073741824
+    assert first.description == "A very nice release"
+    assert first.attributes == {"seeders": "42", "peers": "50", "imdb": "tt1234567"}
+
+
+def test_parse_indexer_rss_missing_optional_fields_default_to_none():
+    parsed = parse_indexer_rss(SAMPLE_RSS)
+    second = parsed.items[1]
+
+    assert second.size is None
+    assert second.description is None
+    # Category text may carry extra tokens; only the id is kept.
+    assert second.category == "2000"
+    assert second.attributes == {"seeders": "5"}
+
+
+def test_parse_indexer_rss_uses_link_when_guid_is_permalink():
+    rss = """<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0">
+      <channel>
+        <item>
+          <title>x</title>
+          <guid isPermaLink="true">https://indexer.invalid/details/1</guid>
+          <link>https://indexer.invalid/details/1</link>
+          <pubDate>Sun, 04 Oct 2026 12:00:00 +0000</pubDate>
+          <category>5000</category>
+        </item>
+      </channel>
+    </rss>
+    """
+
+    item = parse_indexer_rss(rss).items[0]
+
+    assert item.guid == "https://indexer.invalid/details/1"
+
+
+def test_parse_indexer_rss_tolerates_missing_namespaces():
+    rss = """<rss version="2.0"><channel>
+      <newznab:response xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/"
+                        offset="0" total="3"/>
+      <item>
+        <title>plain</title>
+        <guid>g1</guid>
+        <link>https://x.invalid/1</link>
+        <pubDate>Sun, 04 Oct 2026 12:00:00 +0000</pubDate>
+        <category>1000</category>
+      </item>
+    </channel></rss>"""
+
+    parsed = parse_indexer_rss(rss)
+
+    assert parsed.total == 3
+    assert parsed.offset == 0
+    assert parsed.items[0].title == "plain"
+
+
+def test_parse_indexer_rss_malformed_xml_raises_value_error():
+    with pytest.raises(ValueError, match="malformed indexer RSS XML"):
+        parse_indexer_rss("<rss><channel></rss>")
+
+
+# --- canonical_query --------------------------------------------------------
+
+
+def test_canonical_query_ignores_apikey_and_strips_whitespace():
+    result = canonical_query({"apikey": "secret", "q": "  hello ", " cat ": " 5040 "})
+
+    assert result == ("cat=5040", "q=hello")
+
+
+def test_canonical_query_is_order_independent():
+    left = canonical_query({"b": "2", "a": "1"})
+    right = canonical_query({"a": "1", "b": "2"})
+
+    assert left == right == ("a=1", "b=2")
+
+
+def test_canonical_query_empty():
+    assert canonical_query({}) == ()
+    assert canonical_query({"apikey": "only"}) == ()
+
+
+# --- guid composition -------------------------------------------------------
+
+
+def test_compose_and_split_guid_round_trip():
+    guid = compose_guid("nzbgeek", "abc:def")
+
+    assert guid == "nzbgeek:abc:def"
+    assert split_guid(guid) == ("nzbgeek", "abc:def")
+
+
+def test_split_guid_without_colon_returns_none():
+    assert split_guid("no-colon") is None
+
+
+def test_compose_guid_rejects_indexer_name_with_colon():
+    with pytest.raises(ValueError, match="must not contain"):
+        compose_guid("bad:name", "abc")
