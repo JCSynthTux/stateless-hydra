@@ -159,6 +159,10 @@ class ResultItem(BaseModel):
     category: str
     size: int | None = None
     description: str | None = None
+    # Download URL advertised as an RSS ``<enclosure>``. Newznab clients
+    # (AIOStreams among them) fetch the NZB from this URL, and drop items that
+    # lack an ``application/x-nzb`` enclosure. ``None`` means no enclosure.
+    enclosure_url: str | None = None
     attributes: dict[str, str] = Field(default_factory=dict)
 
 
@@ -327,6 +331,7 @@ def _item_to_json(item: ResultItem) -> dict[str, Any]:
         "category": item.category,
         "size": item.size,
         "description": item.description,
+        "enclosure": item.enclosure_url,
         "attributes": dict(item.attributes),
     }
 
@@ -342,7 +347,10 @@ def render_results(
     The XML document declares the ``atom``, ``newznab`` and ``torznab``
     namespaces (the atom prefix is kept for newznab-client compatibility) and
     carries a channel-level ``<newznab:response offset=... total=.../>`` followed
-    by one ``<item>`` per result. Each ``attributes`` entry becomes a
+    by one ``<item>`` per result. When ``item.enclosure_url`` is set an
+    ``<enclosure url=... length=... type="application/x-nzb"/>`` is rendered
+    (nzbhydra2 parity; AIOStreams' newznab integration drops items without one).
+    Each ``attributes`` entry becomes a
     ``<torznab:attr name=... value=.../>`` element.
 
     When ``o == "json"`` a JSON-serializable dict is returned with this exact
@@ -357,7 +365,8 @@ def render_results(
                         {
                             "title": ..., "guid": ..., "link": ...,
                             "pubDate": ..., "category": ..., "size": ...,
-                            "description": ..., "attributes": {...},
+                            "description": ..., "enclosure": ...,
+                            "attributes": {...},
                         }
                     ],
                 }
@@ -394,6 +403,15 @@ def render_results(
         etree.SubElement(item_el, "title").text = item.title
         etree.SubElement(item_el, "guid", isPermaLink="false").text = item.guid
         etree.SubElement(item_el, "link").text = item.link
+        if item.enclosure_url is not None:
+            # nzbhydra2 emits the download URL as an enclosure; clients such as
+            # AIOStreams build the NZB URL from it and skip items without an
+            # ``application/x-nzb`` enclosure entirely. ``length`` is omitted
+            # when the size is unknown rather than emitted as an empty value.
+            enclosure_attrs = {"url": item.enclosure_url, "type": "application/x-nzb"}
+            if item.size is not None:
+                enclosure_attrs["length"] = str(item.size)
+            etree.SubElement(item_el, "enclosure", **enclosure_attrs)
         etree.SubElement(item_el, "pubDate").text = item.pub_date
         etree.SubElement(item_el, "category").text = item.category
         if item.size is not None:
@@ -433,6 +451,9 @@ def _parse_item(element: etree._Element) -> ResultItem:
             continue
         attributes[name] = child.get("value") or ""
 
+    enclosure_el = _child(element, "enclosure")
+    enclosure_url = enclosure_el.get("url") if enclosure_el is not None else None
+
     return ResultItem(
         title=title,
         guid=guid,
@@ -441,6 +462,7 @@ def _parse_item(element: etree._Element) -> ResultItem:
         category=category,
         size=_int_or_none(_text(_child(element, "size"))),
         description=_text(_child(element, "description")),
+        enclosure_url=enclosure_url,
         attributes=attributes,
     )
 

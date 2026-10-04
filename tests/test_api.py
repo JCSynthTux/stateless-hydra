@@ -45,6 +45,11 @@ def _guids(response_text: str) -> list[str]:
     return [element.findtext("guid") for element in _items(response_text)]
 
 
+def _enclosures(response_text: str) -> list:
+    """The ``<enclosure>`` element of each item (``None`` when absent)."""
+    return [item.find("enclosure") for item in _items(response_text)]
+
+
 def _response_total(response_text: str) -> str | None:
     root = etree.fromstring(response_text.encode("utf-8"))
     for element in root.iter():
@@ -150,6 +155,56 @@ def test_search_limit_slices_items_but_keeps_total(client, sample_rss):
 
     assert len(_items(response.text)) == 1
     assert _response_total(response.text) == "4"
+
+
+@respx.mock
+def test_search_items_carry_nzb_enclosure_pointing_at_our_getnzb(client, sample_rss):
+    # AIOStreams' newznab integration reads the NZB URL from <enclosure> and
+    # silently drops every item without an ``application/x-nzb`` one. The URL
+    # must be our own getnzb endpoint (composed guid) so downloads stay routed
+    # through the limit tracker instead of leaking an upstream indexer key.
+    respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+    respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
+
+    response = client.get(API, params={"t": "search", "q": "ubuntu", "apikey": KEY})
+
+    enclosures = _enclosures(response.text)
+    assert all(enclosure is not None for enclosure in enclosures)
+    assert all(enclosure.get("type") == "application/x-nzb" for enclosure in enclosures)
+    # The enclosure URL targets our own /api and carries the composed guid,
+    # url-encoded, plus the caller's key.
+    first = enclosures[0]
+    params = dict(httpx.URL(first.get("url")).params)
+    assert first.get("url").startswith(f"http://testserver{API}?")
+    assert params["t"] == "getnzb"
+    assert params["id"] == "slug:sguid-one"
+    assert params["apikey"] == KEY
+    assert first.get("length") == "123456"
+
+
+@respx.mock
+def test_enclosure_url_round_trips_through_getnzb(client, sample_rss):
+    def _geek(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("t") == "getnzb":
+            return httpx.Response(200, content=b"real-nzb")
+        return httpx.Response(200, text=sample_rss)
+
+    respx.get(GEEK).mock(side_effect=_geek)
+    respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
+
+    search = client.get(
+        API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek"}
+    )
+    enclosure = _enclosures(search.text)[0]
+    # Follow the advertised download URL. With respx installed, TestClient must
+    # be given a relative path so the request reaches the ASGI app; the parsed
+    # path+query is behaviourally identical to what a real client fetches.
+    url = httpx.URL(enclosure.get("url"))
+    download = client.get(url.path, params=dict(url.params))
+
+    assert download.status_code == 200
+    assert download.content == b"real-nzb"
+    assert download.headers["content-type"] == "application/x-nzb"
 
 
 @respx.mock

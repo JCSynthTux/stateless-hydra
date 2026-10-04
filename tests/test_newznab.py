@@ -305,6 +305,43 @@ def test_render_results_omits_size_when_none():
     assert parse_indexer_rss(render_results([item], total=1, offset=0)).items == [item]
 
 
+def test_render_results_renders_nzb_enclosure_when_url_set():
+    # AIOStreams' newznab integration builds the NZB URL from the enclosure and
+    # silently drops every item that lacks an ``application/x-nzb`` one, so the
+    # presence and shape of this element are load-bearing for compatibility.
+    item = _sample_item(enclosure_url="https://hydra.invalid/api?t=getnzb&id=ix%3Aabc123")
+    root = _parse(render_results([item], total=1, offset=0))
+
+    enclosure = root.find(".//item/enclosure")
+    assert enclosure is not None
+    assert enclosure.get("url") == item.enclosure_url
+    assert enclosure.get("length") == str(item.size)
+    assert enclosure.get("type") == "application/x-nzb"
+
+
+def test_render_results_omits_enclosure_when_url_none():
+    item = _sample_item()
+    root = _parse(render_results([item], total=1, offset=0))
+
+    assert root.find(".//item/enclosure") is None
+
+
+def test_render_results_enclosure_omits_length_when_size_none():
+    item = _sample_item(size=None, enclosure_url="https://hydra.invalid/api?t=getnzb&id=x")
+    enclosure = _parse(render_results([item], total=1, offset=0)).find(".//item/enclosure")
+
+    assert enclosure is not None
+    assert enclosure.get("length") is None
+
+
+def test_render_results_enclosure_round_trips_through_parser():
+    item = _sample_item(enclosure_url="https://hydra.invalid/api?t=getnzb&id=ix%3Aabc123")
+    parsed = parse_indexer_rss(render_results([item], total=1, offset=0))
+
+    assert parsed.items == [item]
+    assert parsed.items[0].enclosure_url == item.enclosure_url
+
+
 def test_render_results_json_exact_shape():
     item = _sample_item()
     out = render_results([item], total=2, offset=1, o="json")
@@ -323,6 +360,7 @@ def test_render_results_json_exact_shape():
             "category": item.category,
             "size": item.size,
             "description": item.description,
+            "enclosure": item.enclosure_url,
             "attributes": item.attributes,
         }
     ]

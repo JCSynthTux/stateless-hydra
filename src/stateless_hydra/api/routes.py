@@ -19,6 +19,7 @@ import time
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
+from urllib.parse import urlencode
 
 from fastapi import APIRouter, FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -140,6 +141,22 @@ def _enabled_owner(request: Request, indexer_name: str) -> bool:
     """
     indexer = request.app.state.indexers.get(indexer_name)
     return indexer is not None and indexer.enabled
+
+
+def _download_url(request: Request, composed_guid: str) -> str:
+    """Build this proxy's ``getnzb`` URL for a composed guid.
+
+    The URL points at our own ``/api`` endpoint so downloads flow back through
+    the limit tracker and indexer routing, matching nzbhydra2 (which advertises
+    its own download link in each item). The caller's API key is carried in the
+    query string because clients fetch the enclosure URL verbatim and would not
+    otherwise authenticate. It is the caller's own credential, never an indexer
+    key.
+    """
+    base = str(request.base_url).rstrip("/")
+    apikey = request.query_params.get("apikey", "")
+    query = urlencode({"t": "getnzb", "id": composed_guid, "apikey": apikey})
+    return f"{base}{request.url.path}?{query}"
 
 
 async def _update_limit_gauge(request: Request, indexer: str, kind: LimitKind) -> None:
@@ -289,7 +306,18 @@ async def _handle_search(request: Request, function: str, o: str) -> Response:
 
     total = len(ordered)
     page = ordered[offset : offset + limit]
-    items = [item.model_copy(update={"guid": compose_guid(name, item.guid)}) for name, item in page]
+    items = []
+    for name, item in page:
+        guid = compose_guid(name, item.guid)
+        download_url = _download_url(request, guid)
+        # nzbhydra2 advertises its own download link as both the item link and
+        # the enclosure URL; AIOStreams (newznab) requires the enclosure to
+        # build an NZB URL, and Sonarr/Radarr read <link>.
+        items.append(
+            item.model_copy(
+                update={"guid": guid, "link": download_url, "enclosure_url": download_url}
+            )
+        )
     return _render(render_results(items, total, offset, o), o)
 
 
