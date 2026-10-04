@@ -57,7 +57,7 @@ jobs:
       # "Workflow permissions -> Read and write" to be enabled (Settings ->
       # Actions -> General) so GITHUB_TOKEN carries packages: write.
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
