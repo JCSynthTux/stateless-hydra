@@ -108,6 +108,9 @@ spec:
         - name: api-keys
           secret:
             secretName: stateless-hydra-api-keys
-            defaultMode: 0400
+            # 0440 (owner+group read only) keeps the secret readable by the
+            # fsGroup (10001) while remaining non-world-readable; 0400 would
+            # rely on the kubelet flipping ownership for fsGroup.
+            defaultMode: 0440
         - name: tmp
           emptyDir: {}
