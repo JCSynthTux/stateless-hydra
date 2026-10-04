@@ -1,9 +1,12 @@
 name: CI
 
 # Run on every branch push and on every pull request so lint, tests and a
-# Dockerfile build check are available before code reaches main.
+# Dockerfile build check are available before code reaches main. The explicit
+# branches filter keeps tag pushes out of CI: release tags are handled by the
+# publish workflows (release.yml / publish-tag.yml) instead.
 on:
   push:
+    branches: ["**"]
   pull_request:
 
 # Cancel superseded runs for the same ref. Keying on the workflow + ref keeps
@@ -30,7 +33,7 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --frozen
       - name: Ruff lint
         run: uv run ruff check .
       - name: Ruff format check
@@ -49,7 +52,7 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --frozen
       - name: Pytest
         run: uv run pytest
 

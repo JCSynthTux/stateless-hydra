@@ -5,3 +5,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+
+  # Keep Python dependencies (managed by uv) up to date. uv projects are
+  # supported through the standard pip ecosystem.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
