@@ -1,0 +1,73 @@
+name: CI
+
+# Run on every branch push and on every pull request so lint, tests and a
+# Dockerfile build check are available before code reaches main.
+on:
+  push:
+  pull_request:
+
+# Cancel superseded runs for the same ref. Keying on the workflow + ref keeps
+# unrelated branches and pull requests from cancelling each other.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# CI only reads the repository; no write scopes are required.
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint & format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+      - name: Install dependencies
+        run: uv sync
+      - name: Ruff lint
+        run: uv run ruff check .
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+      - name: Install dependencies
+        run: uv sync
+      - name: Pytest
+        run: uv run pytest
+
+  build:
+    name: Build image (no push)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+      # push: false + load: true builds the Dockerfile for real and loads the
+      # result into the local image store, proving it builds without
+      # publishing anything to a registry.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: stateless-hydra:ci
