@@ -1,0 +1,94 @@
+# Basic single-instance Redis for stateless-hydra.
+#
+# Redis backing store for the search cache and the per-indexer daily limit
+# counters. Stateless-hydra is STATELESS (AGENTS.md rule 1); this Redis holds
+# only reconstructible/expiring data, so it runs WITHOUT persistence. Losing
+# it costs a cold cache and a reset of today's counters -- never user data.
+#
+# This single replica is a convenience for development/small installs. For
+# production prefer a managed Redis (ElastiCache, Memorystore, ...) or a
+# properly configured Redis Operator, and point SH_REDIS_URL at it. If you do,
+# you may delete this file from kustomization.yaml.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: stateless-hydra
+  labels:
+    app: redis
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/component: cache
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+        app.kubernetes.io/name: redis
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          # No snapshotting and no AOF: purely in-memory by design.
+          args: ["redis-server", "--save", "", "--appendonly", "no"]
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 20
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: stateless-hydra
+  labels:
+    app: redis
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/component: cache
+spec:
+  type: ClusterIP
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+      protocol: TCP

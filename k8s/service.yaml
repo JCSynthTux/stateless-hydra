@@ -1,0 +1,20 @@
+# ClusterIP Service exposing the stateless-hydra API on port 5076.
+# Point Sonarr/Radarr at http://stateless-hydra.stateless-hydra.svc.cluster.local:5076/api
+# (or an Ingress; this Service is not exposed outside the cluster).
+apiVersion: v1
+kind: Service
+metadata:
+  name: stateless-hydra
+  namespace: stateless-hydra
+  labels:
+    app: stateless-hydra
+    app.kubernetes.io/name: stateless-hydra
+spec:
+  type: ClusterIP
+  selector:
+    app: stateless-hydra
+  ports:
+    - name: http
+      port: 5076
+      targetPort: http
+      protocol: TCP

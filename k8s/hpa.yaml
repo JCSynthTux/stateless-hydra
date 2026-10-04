@@ -1,0 +1,31 @@
+# HorizontalPodAutoscaler for stateless-hydra.
+#
+# Safe to scale horizontally because the pod keeps no local state: the search
+# cache and the per-indexer daily API-hit / NZB-pull counters all live in
+# Redis (AGENTS.md rules 1 and 6). Two replicas therefore share one limit
+# budget rather than each getting its own.
+#
+# Requires metrics-server (or another metrics provider) in the cluster; if
+# absent the Deployment simply stays at its configured replica count.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: stateless-hydra
+  namespace: stateless-hydra
+  labels:
+    app: stateless-hydra
+    app.kubernetes.io/name: stateless-hydra
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: stateless-hydra
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

@@ -1,0 +1,31 @@
+# Application settings mounted into the pod at /config/app.yaml.
+# Non-secret configuration lives in a ConfigMap (AGENTS.md rule 2: only
+# credentials belong in a Secret; this file has none).
+#
+# SH_* environment variables on the container override these values, which
+# is how the Deployment points redis_url at the in-cluster Service.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stateless-hydra-app
+  namespace: stateless-hydra
+  labels:
+    app.kubernetes.io/name: stateless-hydra
+    app.kubernetes.io/component: config
+data:
+  app.yaml: |
+    # stateless-hydra application settings (ConfigMap-managed).
+    log_level: INFO
+    user_agent: "stateless-hydra/0.1.0"
+
+    # Service DNS name of the Redis backing store (see redis.yaml). The
+    # Deployment also sets SH_REDIS_URL, which takes precedence over this.
+    redis_url: "redis://redis:6379/0"
+
+    cache_ttl_seconds: 900
+    dedupe_by_title: false
+    max_results_per_indexer: 100
+    global_proxy_url: null
+
+    host: "0.0.0.0"
+    port: 5076

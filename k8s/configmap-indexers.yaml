@@ -1,0 +1,29 @@
+# Indexer definitions mounted into the pod at /config/indexers.yaml.
+# ConfigMap, not Secret: entries reference API keys by name (apiKeyRef) and
+# never contain the key material itself (AGENTS.md rule 2).
+#
+# Replace the example indexers with real ones before deploying.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stateless-hydra-indexers
+  namespace: stateless-hydra
+  labels:
+    app.kubernetes.io/name: stateless-hydra
+    app.kubernetes.io/component: config
+data:
+  indexers.yaml: |
+    indexers:
+      - name: example_indexer
+        enabled: true
+        host: "https://indexer.example.com"
+        apiPath: "/api"
+        apiKeyRef: "example_indexer_key"
+        apiHitLimit: 1000
+        nzbPullLimit: 100
+        resetTime: "00:00"
+        resetTimezone: "UTC"
+        timeoutSeconds: 30
+        cacheTtlSeconds: 900
+        searchTypes: ["search", "tvsearch", "movie"]
+        categories: [2000, 5000]

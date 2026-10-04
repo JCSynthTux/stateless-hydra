@@ -1,0 +1,21 @@
+# Deploy everything with:
+#   kubectl apply -k k8s/
+#
+# The namespace transformer assigns `namespace: stateless-hydra` to every
+# namespaced resource below, so the individual manifests do not have to repeat
+# it. Remember to replace the Secret placeholders (k8s/secret-api-keys.yaml)
+# and the example indexers (k8s/configmap-indexers.yaml) before applying.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: stateless-hydra
+
+resources:
+  - namespace.yaml
+  - configmap-app.yaml
+  - configmap-indexers.yaml
+  - secret-api-keys.yaml
+  - deployment.yaml
+  - service.yaml
+  - hpa.yaml
+  - redis.yaml

@@ -1,0 +1,113 @@
+# stateless-hydra Deployment.
+#
+# The app is fully stateless (AGENTS.md rule 1): all cache entries and daily
+# limit counters live in Redis, so replicas can be scaled freely and restarted
+# at any time -- see hpa.yaml.
+#
+# Config comes from three read-only mounts:
+#   /config/app.yaml        ConfigMap stateless-hydra-app
+#   /config/indexers.yaml   ConfigMap stateless-hydra-indexers
+#   /config/api-keys.yaml   Secret    stateless-hydra-api-keys (AGENTS.md rule 2)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stateless-hydra
+  namespace: stateless-hydra
+  labels:
+    app: stateless-hydra
+    app.kubernetes.io/name: stateless-hydra
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: stateless-hydra
+  template:
+    metadata:
+      labels:
+        app: stateless-hydra
+        app.kubernetes.io/name: stateless-hydra
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: stateless-hydra
+          # Placeholder: replace with an immutable tag/digest from GHCR in real deployments.
+          image: ghcr.io/stateless-hydra/stateless-hydra:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 5076
+              protocol: TCP
+          env:
+            # Point at the in-cluster Redis Service (redis.yaml). In
+            # production, use a managed/external Redis and set this URL to
+            # that endpoint instead (and drop k8s/redis.yaml).
+            - name: SH_REDIS_URL
+              value: "redis://redis:6379/0"
+          volumeMounts:
+            - name: app-config
+              mountPath: /config/app.yaml
+              subPath: app.yaml
+              readOnly: true
+            - name: indexers-config
+              mountPath: /config/indexers.yaml
+              subPath: indexers.yaml
+              readOnly: true
+            - name: api-keys
+              mountPath: /config/api-keys.yaml
+              subPath: api-keys.yaml
+              readOnly: true
+            # readOnlyRootFilesystem requires a writable scratch space.
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: app-config
+          configMap:
+            name: stateless-hydra-app
+        - name: indexers-config
+          configMap:
+            name: stateless-hydra-indexers
+        - name: api-keys
+          secret:
+            secretName: stateless-hydra-api-keys
+            defaultMode: 0400
+        - name: tmp
+          emptyDir: {}
