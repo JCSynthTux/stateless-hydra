@@ -21,6 +21,9 @@ from typing import Any
 from lxml import etree
 from pydantic import BaseModel, Field
 
+from . import __version__
+from .exceptions import StatelessHydraError
+
 # Newznab error codes, as defined by the Newznab API specification and listed
 # in AGENTS.md rule 5.
 ERROR_CODES: dict[int, str] = {
@@ -103,9 +106,10 @@ _NEWZNAB_NS = "http://www.newznab.com/DTD/2010/feeds/attributes/"
 _TORZNAB_NS = "http://torznab.com/schemas/2015/feed"
 _ATOM_NS = "http://www.w3.org/2005/Atom"
 
-# Fixed server metadata advertised in the ``caps`` document.
+# Fixed server metadata advertised in the ``caps`` document. ``appversion``
+# tracks the package version so there is a single source of truth.
 _SERVER_INFO: dict[str, str] = {
-    "appversion": "0.1.0",
+    "appversion": __version__,
     "version": "2.0",
     "title": "stateless-hydra",
     "strapline": "stateless-hydra",
@@ -122,7 +126,7 @@ _SEARCH_FUNCTIONS: dict[str, tuple[str, str]] = {
 }
 
 
-class NewznabError(Exception):
+class NewznabError(StatelessHydraError):
     """An error expressible as a Newznab ``<error code=... description=.../>``.
 
     ``description`` defaults to the canonical text for ``code``. An unknown code
@@ -205,12 +209,14 @@ def _int_or_none(value: str | None) -> int | None:
 def render_error(code: int, description: str | None = None) -> str:
     """Render a Newznab error document (newline-terminated).
 
-    ``description`` defaults to :data:`ERROR_CODES`; unknown codes fall back to
-    the "Unknown error" text but keep the supplied code so a caller's intent is
-    preserved.
+    Behaves like :class:`NewznabError`: an unknown ``code`` is normalized to
+    ``900``, and ``description`` defaults to :data:`ERROR_CODES` for the
+    (possibly normalized) code. A caller-supplied description is kept as-is.
     """
+    if code not in ERROR_CODES:
+        code = 900
     if description is None:
-        description = ERROR_CODES.get(code, ERROR_CODES[900])
+        description = ERROR_CODES[code]
     element = etree.Element("error", code=str(code), description=description)
     return etree.tostring(element, encoding="unicode") + "\n"
 
@@ -242,9 +248,10 @@ def _categories_json() -> list[dict[str, Any]]:
 def render_caps(search_types: Collection[str], o: str = "xml") -> str | dict:
     """Render the Newznab ``caps`` document.
 
-    Only search functions present in ``search_types`` are advertised. Accepted
-    names are the Newznab function names ``search``, ``tvsearch``, ``movie``,
-    ``music`` and ``book``.
+    Only search functions present in ``search_types`` are advertised. The
+    accepted vocabulary is exactly the Newznab function names ``"search"``,
+    ``"tvsearch"``, ``"movie"``, ``"music"`` and ``"book"``; any other value
+    raises :class:`ValueError` listing the valid names.
 
     XML output is a ``<caps>`` document. When ``o == "json"`` a JSON-serializable
     dict with the following exact shape is returned::
@@ -269,7 +276,15 @@ def render_caps(search_types: Collection[str], o: str = "xml") -> str | dict:
                 ],
             }
         }
+
+    Raises:
+        ValueError: if ``search_types`` contains an unknown search function.
     """
+    unknown = sorted(name for name in search_types if name not in _SEARCH_FUNCTIONS)
+    if unknown:
+        valid = ", ".join(repr(name) for name in _SEARCH_FUNCTIONS)
+        raise ValueError(f"unknown search type(s) {unknown}; valid search types are: {valid}")
+
     searching = [
         (tag, supported)
         for function, (tag, supported) in _SEARCH_FUNCTIONS.items()
@@ -464,19 +479,23 @@ def parse_indexer_rss(xml_text: str) -> ParsedRss:
     return ParsedRss(items=items, total=total, offset=offset)
 
 
-def canonical_query(params: Mapping[str, str]) -> tuple[str, ...]:
+def canonical_query(params: Mapping[Any, Any]) -> tuple[str, ...]:
     """Return a stable cache key for a set of query parameters.
 
     The ``apikey`` parameter is dropped (it is a credential, not part of the
-    query semantics), keys and values are stripped, and the result is sorted so
-    that dict iteration order cannot affect the key.
+    query semantics). ``None`` values are treated as absent and skipped. Keys
+    and values are coerced with :func:`str`, stripped of surrounding whitespace,
+    and empty keys are skipped. The result is sorted so dict iteration order
+    cannot affect the key. This never raises for a ``Mapping`` input.
     """
     pairs: list[str] = []
     for key, value in params.items():
-        clean_key = key.strip()
-        if clean_key.lower() == "apikey":
+        if value is None:
             continue
-        pairs.append(f"{clean_key}={value.strip()}")
+        clean_key = str(key).strip()
+        if not clean_key or clean_key.lower() == "apikey":
+            continue
+        pairs.append(f"{clean_key}={str(value).strip()}")
     pairs.sort()
     return tuple(pairs)
 

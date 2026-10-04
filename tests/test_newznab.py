@@ -8,6 +8,8 @@ in-memory strings and dataclasses. Fixtures live in this file because
 import pytest
 from lxml import etree
 
+from stateless_hydra import __version__
+from stateless_hydra.exceptions import StatelessHydraError
 from stateless_hydra.newznab import (
     CATEGORIES,
     ERROR_CODES,
@@ -86,6 +88,18 @@ def test_newznab_error_unknown_code_falls_back_to_900():
     assert error.description == "Unknown error"
 
 
+def test_newznab_error_9999_normalizes_to_900():
+    error = NewznabError(9999)
+
+    assert error.code == 900
+    assert error.description == "Unknown error"
+
+
+def test_newznab_error_is_stateless_hydra_error():
+    assert issubclass(NewznabError, StatelessHydraError)
+    assert isinstance(NewznabError(900), StatelessHydraError)
+
+
 def test_newznab_error_custom_description_is_kept():
     error = NewznabError(100, "nope")
 
@@ -111,6 +125,12 @@ def test_render_error_escapes_description():
     _parse(rendered)  # still well-formed
 
 
+def test_render_error_unknown_code_normalizes_to_900():
+    assert render_error(9999) == '<error code="900" description="Unknown error"/>\n'
+    # A caller-supplied description is preserved, matching NewznabError.
+    assert render_error(9999, "custom") == '<error code="900" description="custom"/>\n'
+
+
 # --- render_caps ------------------------------------------------------------
 
 
@@ -121,12 +141,19 @@ def test_render_caps_xml_is_well_formed_with_expected_structure():
     assert root.tag == "caps"
     server = root.find("server")
     assert server is not None
-    assert server.get("appversion") == "0.1.0"
+    assert server.get("appversion") == __version__
     assert server.get("version") == "2.0"
     assert server.get("title") == "stateless-hydra"
     assert server.get("strapline") == "stateless-hydra"
     assert root.find("searching") is not None
     assert root.find("categories") is not None
+
+
+def test_render_caps_unknown_search_type_raises_value_error():
+    with pytest.raises(ValueError, match="unknown search type"):
+        render_caps({"search", "bogus"})
+    with pytest.raises(ValueError, match="unknown search type"):
+        render_caps({"bogus"}, o="json")
 
 
 def test_render_caps_only_advertises_requested_search_types():
@@ -184,7 +211,7 @@ def test_render_caps_json_exact_shape():
 
     assert set(caps) == {"caps"}
     assert caps["caps"]["server"] == {
-        "appversion": "0.1.0",
+        "appversion": __version__,
         "version": "2.0",
         "title": "stateless-hydra",
         "strapline": "stateless-hydra",
@@ -373,6 +400,91 @@ def test_parse_indexer_rss_tolerates_missing_namespaces():
     assert parsed.items[0].title == "plain"
 
 
+def test_parse_indexer_rss_matches_attr_by_namespace_not_prefix():
+    # The prefix is arbitrary ("foo"); only the namespace URI matters.
+    rss = """<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0" xmlns:foo="http://torznab.com/schemas/2015/feed">
+      <channel>
+        <item>
+          <title>t</title>
+          <guid>g</guid>
+          <link>https://x.invalid/1</link>
+          <pubDate>Sun, 04 Oct 2026 12:00:00 +0000</pubDate>
+          <category>5040</category>
+          <foo:attr name="seeders" value="7"/>
+          <foo:attr name="peers" value="8"/>
+        </item>
+      </channel>
+    </rss>"""
+
+    parsed = parse_indexer_rss(rss)
+
+    assert parsed.items[0].attributes == {"seeders": "7", "peers": "8"}
+
+
+def test_parse_indexer_rss_reads_unqualified_attr_elements():
+    rss = """<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0">
+      <channel>
+        <item>
+          <title>t</title>
+          <guid>g</guid>
+          <link>https://x.invalid/1</link>
+          <pubDate>Sun, 04 Oct 2026 12:00:00 +0000</pubDate>
+          <category>5040</category>
+          <attr name="seeders" value="3"/>
+        </item>
+      </channel>
+    </rss>"""
+
+    parsed = parse_indexer_rss(rss)
+
+    assert parsed.items[0].attributes == {"seeders": "3"}
+
+
+def test_parse_indexer_rss_duplicate_attribute_last_value_wins():
+    rss = """<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"
+         xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/"
+         xmlns:torznab="http://torznab.com/schemas/2015/feed">
+      <channel>
+        <item>
+          <title>t</title>
+          <guid>g</guid>
+          <link>https://x.invalid/1</link>
+          <pubDate>Sun, 04 Oct 2026 12:00:00 +0000</pubDate>
+          <category>5040</category>
+          <torznab:attr name="seeders" value="1"/>
+          <newznab:attr name="seeders" value="9"/>
+        </item>
+      </channel>
+    </rss>"""
+
+    parsed = parse_indexer_rss(rss)
+
+    assert parsed.items[0].attributes == {"seeders": "9"}
+
+
+def test_parse_render_parse_round_trip_preserves_items():
+    first_pass = parse_indexer_rss(SAMPLE_RSS)
+
+    rendered = render_results(
+        first_pass.items,
+        total=first_pass.total or 0,
+        offset=first_pass.offset or 0,
+    )
+    second_pass = parse_indexer_rss(rendered)
+
+    assert second_pass.total == first_pass.total
+    assert second_pass.offset == first_pass.offset
+    assert second_pass.items == first_pass.items
+    for item in second_pass.items:
+        assert item.title
+        assert item.guid
+        assert item.category
+        assert item.attributes
+
+
 def test_parse_indexer_rss_malformed_xml_raises_value_error():
     with pytest.raises(ValueError, match="malformed indexer RSS XML"):
         parse_indexer_rss("<rss><channel></rss>")
@@ -397,6 +509,19 @@ def test_canonical_query_is_order_independent():
 def test_canonical_query_empty():
     assert canonical_query({}) == ()
     assert canonical_query({"apikey": "only"}) == ()
+
+
+def test_canonical_query_handles_none_int_and_empty_keys():
+    result = canonical_query({"b": None, "a": 2, "": "x", "   ": "y", "q": "z"})
+
+    assert result == ("a=2", "q=z")
+
+
+def test_canonical_query_mixed_input_is_deterministic_and_never_raises():
+    left = canonical_query({"q": 5000, "missing": None, "cat": " 5040 "})
+    right = canonical_query({"cat": " 5040 ", "missing": None, "q": 5000})
+
+    assert left == right == ("cat=5040", "q=5000")
 
 
 # --- guid composition -------------------------------------------------------
