@@ -1,0 +1,80 @@
+name: Release
+
+# Two distinct triggers share this workflow:
+#   * pushes to main drive semantic-release, because the conventional-commit
+#     history on main determines the next SemVer bump and the release commit;
+#   * pushes of v* tags publish the image, because semantic-release creates the
+#     tag only after it has committed the version bump on main, so the tag is
+#     the definitive "this commit is a release" signal.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Semantic release
+    # Only the branch push on main runs the version bump; tag pushes skip it.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      # Needed to push the version-bump commit and the new tag back to main.
+      contents: write
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          # semantic-release needs the complete commit history and tags to
+          # determine the next version from conventional commits.
+          fetch-depth: 0
+      - name: Python Semantic Release
+        uses: python-semantic-release/python-semantic-release@v9
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+  publish:
+    name: Publish image to GHCR
+    # Only tag pushes publish an image; branch pushes on main skip it.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required to push the image to the GitHub Container Registry.
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha
+      # NOTE: pushing to GHCR requires the repository setting
+      # "Workflow permissions -> Read and write" to be enabled (Settings ->
+      # Actions -> General) so GITHUB_TOKEN carries packages: write.
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
