@@ -18,8 +18,9 @@ data:
     log_level: INFO
     user_agent: "stateless-hydra/0.1.0"
 
-    # Service DNS name of the Redis backing store (see redis.yaml). The
-    # Deployment also sets SH_REDIS_URL, which takes precedence over this.
+    # Point this at your Redis service (matches the Service name in
+    # redis.yaml). SH_* env vars set on the Deployment WOULD override this —
+    # prefer editing this file.
     redis_url: "redis://redis:6379/0"
 
     cache_ttl_seconds: 900

@@ -43,12 +43,9 @@ spec:
             - name: http
               containerPort: 5076
               protocol: TCP
-          env:
-            # Point at the in-cluster Redis Service (redis.yaml). In
-            # production, use a managed/external Redis and set this URL to
-            # that endpoint instead (and drop k8s/redis.yaml).
-            - name: SH_REDIS_URL
-              value: "redis://redis:6379/0"
+          # redis_url comes from the mounted app-config ConfigMap
+          # (redis_url: in k8s/configmap-app.yaml). Do not set SH_REDIS_URL
+          # here: SH_* env vars override the config file.
           volumeMounts:
             - name: app-config
               mountPath: /config/app.yaml

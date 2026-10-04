@@ -16,7 +16,9 @@ log_level: INFO
 user_agent: "stateless-hydra/0.1.0"
 
 # Redis connection URL. All runtime state (search cache + daily limit
-# counters) lives here; the app itself stores nothing locally.
+# counters) lives here; the app itself stores nothing locally. In
+# Kubernetes this value lives in the ConfigMap (k8s/configmap-app.yaml) and
+# should match your Redis Service name; SH_REDIS_URL env would override it.
 # env: SH_REDIS_URL
 redis_url: "redis://localhost:6379/0"
 

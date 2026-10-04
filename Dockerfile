@@ -36,9 +36,11 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     SH_APP_CONFIG=/config/app.yaml \
     SH_INDEXERS_FILE=/config/indexers.yaml \
     SH_API_KEYS_FILE=/config/api-keys.yaml \
-    SH_REDIS_URL=redis://redis:6379/0 \
     SH_HOST=0.0.0.0 \
     SH_PORT=5076
+
+# No SH_REDIS_URL default here — the mounted config file (app.yaml) is the
+# single source of truth; SH_* env vars would override it.
 
 # Non-root runtime user (matches the Kubernetes runAsUser in k8s/deployment.yaml).
 RUN groupadd --gid 10001 hydra \

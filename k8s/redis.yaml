@@ -7,8 +7,9 @@
 #
 # This single replica is a convenience for development/small installs. For
 # production prefer a managed Redis (ElastiCache, Memorystore, ...) or a
-# properly configured Redis Operator, and point SH_REDIS_URL at it. If you do,
-# you may delete this file from kustomization.yaml.
+# properly configured Redis Operator, and point `redis_url` in
+# k8s/configmap-app.yaml at it. If you do, you may delete this file from
+# kustomization.yaml.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
