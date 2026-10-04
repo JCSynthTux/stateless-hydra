@@ -74,6 +74,18 @@ indexers:
     apiKeyRef: anzb
 """
 
+MISSING_INDEXERS_KEY_YAML = """
+someUnknownKey: ignored
+"""
+
+NON_LIST_INDEXERS_YAML = """
+indexers: not-a-list
+"""
+
+EMPTY_INDEXERS_YAML = """
+indexers: []
+"""
+
 API_KEYS_YAML = """
 apiKeys:
   nzbgeek: secret-key-123
@@ -135,8 +147,37 @@ def test_unknown_top_level_keys_are_ignored(tmp_path):
     assert [indexer.name for indexer in indexers] == ["anzb"]
 
 
+def test_missing_indexers_key_raises_config_error(tmp_path):
+    path = _write(tmp_path, "indexers.yaml", MISSING_INDEXERS_KEY_YAML)
+    with pytest.raises(ConfigError):
+        load_indexers(path)
+
+
+def test_non_list_indexers_raises_config_error(tmp_path):
+    path = _write(tmp_path, "indexers.yaml", NON_LIST_INDEXERS_YAML)
+    with pytest.raises(ConfigError):
+        load_indexers(path)
+
+
+def test_empty_indexers_list_loads_to_empty(tmp_path):
+    path = _write(tmp_path, "indexers.yaml", EMPTY_INDEXERS_YAML)
+    assert load_indexers(path) == []
+
+
 def test_invalid_reset_time_raises_config_error(tmp_path):
     path = _write(tmp_path, "indexers.yaml", BAD_RESET_TIME_YAML)
+    with pytest.raises(ConfigError):
+        load_indexers(path)
+
+
+@pytest.mark.parametrize("value", ["1:30", " 12:30 ", "24:00", "+1:30", "12:60"])
+def test_reset_time_strict_format_rejects_invalid(tmp_path, value):
+    path = _write(
+        tmp_path,
+        "indexers.yaml",
+        f"indexers:\n  - name: bad\n    host: https://api.example.invalid\n"
+        f'    apiKeyRef: bad\n    resetTime: "{value}"\n',
+    )
     with pytest.raises(ConfigError):
         load_indexers(path)
 
@@ -241,3 +282,11 @@ def test_env_overrides_yaml(tmp_path, monkeypatch):
     assert settings.port == 9999
     assert settings.log_level == "WARNING"
     assert settings.max_results_per_indexer == 50
+
+
+def test_invalid_env_value_raises_config_error(tmp_path, monkeypatch):
+    _clear_sh_env(monkeypatch)
+    monkeypatch.setenv("SH_PORT", "notanint")
+
+    with pytest.raises(ConfigError):
+        load_settings(str(tmp_path / "missing-app.yaml"))

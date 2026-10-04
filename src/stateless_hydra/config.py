@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -26,6 +27,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from .exceptions import ConfigError
 
 _VALID_SEARCH_TYPES = {"search", "tvsearch", "movie", "music", "book"}
+_RESET_TIME_PATTERN = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
 
 class ProxyConfig(BaseModel):
@@ -51,22 +53,15 @@ class IndexerConfig(BaseModel):
     timeout_seconds: float = Field(default=30.0, alias="timeoutSeconds", gt=0)
     # None -> global default; <=0 -> disabled
     cache_ttl_seconds: int | None = Field(default=None, alias="cacheTtlSeconds")
-    search_types: list[str] = Field(default=["search"], alias="searchTypes")
+    search_types: list[str] = Field(default_factory=lambda: ["search"], alias="searchTypes")
     categories: list[int] | None = Field(default=None, alias="categories")  # None -> all
     proxy_url: str | None = Field(default=None, alias="proxyUrl")  # per-indexer override
 
     @field_validator("reset_time")
     @classmethod
     def _validate_reset_time(cls, value: str) -> str:
-        parts = value.split(":")
-        if len(parts) != 2:
-            raise ValueError("reset_time must be in HH:MM 24-hour format")
-        try:
-            hours, minutes = int(parts[0]), int(parts[1])
-        except ValueError as exc:
-            raise ValueError("reset_time must be in HH:MM 24-hour format") from exc
-        if not (0 <= hours <= 23 and 0 <= minutes <= 59):
-            raise ValueError("reset_time must be a valid time in HH:MM 24-hour format")
+        if _RESET_TIME_PATTERN.fullmatch(value) is None:
+            raise ValueError("reset_time must be in strict HH:MM 24-hour format")
         return value
 
     @field_validator("reset_timezone")
@@ -93,8 +88,8 @@ class ApiKeysFile(BaseModel):
 
     model_config = ConfigDict(populate_by_name=True)
 
-    api_keys: dict[str, str] = Field(default={}, alias="apiKeys")  # refs -> keys
-    hydra_api_keys: list[str] = Field(default=[], alias="hydraApiKeys")  # client keys
+    api_keys: dict[str, str] = Field(default_factory=dict, alias="apiKeys")  # refs -> keys
+    hydra_api_keys: list[str] = Field(default_factory=list, alias="hydraApiKeys")  # client keys
 
 
 class AppSettings(BaseSettings):
@@ -153,7 +148,11 @@ def load_settings(app_config: str | None = None) -> AppSettings:
     default path (``app_config`` field) is used. A missing file is not an
     error: environment variables and defaults are used instead.
     """
-    defaults = AppSettings()
+    try:
+        defaults = AppSettings()
+    except ValidationError as exc:
+        raise ConfigError(f"invalid application settings (environment): {exc}") from exc
+
     path = Path(app_config) if app_config is not None else Path(defaults.app_config)
 
     yaml_data: dict = {}
@@ -170,9 +169,11 @@ def load_settings(app_config: str | None = None) -> AppSettings:
 def load_indexers(path: str) -> list[IndexerConfig]:
     """Load indexer definitions from ``{indexers: [...]}`` YAML."""
     data = _read_yaml_mapping(Path(path), "indexers config file")
-    raw = data.get("indexers", [])
+    if "indexers" not in data:
+        raise ConfigError(f"indexers config file {path} must contain an 'indexers' key")
+    raw = data["indexers"]
     if not isinstance(raw, list):
-        raise ConfigError(f"indexers config file {path} must contain an 'indexers' list")
+        raise ConfigError(f"indexers config file {path} must have an 'indexers' list")
 
     indexers: list[IndexerConfig] = []
     seen: set[str] = set()
