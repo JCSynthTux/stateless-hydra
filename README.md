@@ -28,8 +28,8 @@ runtime state lives in Redis.
   prefixed with `SH_` override file values.
 - **Configurable User-Agent** — set globally, because some indexers rate-limit
   or block unknown agents.
-- **Global and per-indexer proxies** — route all indexer traffic through a
-  proxy, or override it for a single indexer.
+- **Global and per-indexer proxies** — route all indexer traffic through an
+  HTTP(S) or SOCKS5 proxy, or override it for a single indexer.
 - **Prometheus metrics** — counters and histograms under the `stateless_hydra_`
   prefix, scraped from `/metrics`.
 - **Newznab/Torznab compatible** — `caps`, `search`, `tvsearch`, `movie`,
@@ -127,12 +127,17 @@ override file values.
 | `cache_ttl_seconds` | `900` | `SH_CACHE_TTL_SECONDS` | Default search cache TTL; `0` disables caching. |
 | `dedupe_by_title` | `false` | `SH_DEDUPE_BY_TITLE` | Collapse identical titles across indexers. |
 | `max_results_per_indexer` | `100` | `SH_MAX_RESULTS_PER_INDEXER` | Max results requested per indexer. |
-| `global_proxy_url` | unset | `SH_GLOBAL_PROXY_URL` | Default HTTP(S)/SOCKS proxy for indexer requests. |
+| `global_proxy_url` | unset | `SH_GLOBAL_PROXY_URL` | Default proxy for indexer requests: `http://`, `https://`, `socks5://` (or `socks5h://`). |
 | `host` | `0.0.0.0` | `SH_HOST` | Bind interface. |
 | `port` | `5076` | `SH_PORT` | Bind port (nzbhydra2's default). |
 | `app_config` | `/config/app.yaml` | `SH_APP_CONFIG` | Path to this file. |
 | `indexers_file` | `/config/indexers.yaml` | `SH_INDEXERS_FILE` | Path to the indexers file. |
 | `api_keys_file` | `/config/api-keys.yaml` | `SH_API_KEYS_FILE` | Path to the secrets file. |
+
+Proxy URLs are passed straight to httpx, which supports `http://`, `https://`,
+`socks5://` and `socks5h://`. SOCKS support is compiled into the image via the
+`httpx[socks]` extra (socksio), so the same schemes work for both
+`global_proxy_url` and per-indexer `proxyUrl`.
 
 ### `indexers.yaml` — indexer definitions
 
@@ -153,7 +158,7 @@ Top-level shape: `{ indexers: [ ... ] }`.
 | `cacheTtlSeconds` | `null` | Per-indexer cache TTL; `null` = global default, `<= 0` disables. |
 | `searchTypes` | `["search"]` | Any of `search`, `tvsearch`, `movie`, `music`, `book`. |
 | `categories` | `null` (all) | List of Newznab category ids to search. |
-| `proxyUrl` | `null` | Per-indexer proxy; overrides `global_proxy_url`. |
+| `proxyUrl` | `null` | Per-indexer proxy; overrides `global_proxy_url` (same supported schemes). |
 
 **Reset semantics.** A fresh daily counter is used for each indexer. The
 counter key includes the current date *in the indexer's `resetTimezone`*, so
@@ -169,7 +174,7 @@ limit of `0` means unlimited but usage is still counted for metrics.
 | Key | Shape | Description |
 | --- | --- | --- |
 | `apiKeys` | `{ref: "real-key"}` | Maps each indexer's `apiKeyRef` to its real API key. |
-| `hydraApiKeys` | `["key", ...]` | API keys clients present to `/api`. At least one required. |
+| `hydraApiKeys` | `["key", ...]` | API keys clients present to `/api`. Must contain at least one entry (the app refuses to start otherwise). |
 
 ## How limits work
 
@@ -293,7 +298,5 @@ for the full set of project rules.
 Versioning is driven by Conventional Commits through `python-semantic-release`
 (configured in `pyproject.toml`): `feat` → minor, `fix` → patch, `BREAKING
 CHANGE` → major, with tags of the form `v{version}`. Container images are
-published to the GitHub Container Registry as
-`ghcr.io/stateless-hydra/stateless-hydra`; the Kubernetes manifests use
-`:latest` as a placeholder — pin an immutable tag or digest in real
-deployments.
+published to the GitHub Container Registry (ghcr.io) by the CI release
+pipeline.
