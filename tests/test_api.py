@@ -1,0 +1,409 @@
+"""Integration tests for the assembled FastAPI application.
+
+The app is built from temporary YAML config with ``fakeredis`` as the Redis
+backend; every upstream indexer call is intercepted by ``respx``. No live
+services are required.
+"""
+
+from __future__ import annotations
+
+import httpx
+import pytest
+import respx
+from fakeredis import aioredis
+from fastapi.testclient import TestClient
+from lxml import etree
+
+from stateless_hydra.config import AppSettings
+from stateless_hydra.exceptions import ConfigError
+from stateless_hydra.main import create_app
+
+API = "/api"
+KEY = "test-key"
+GEEK = "https://nzbgeek.example.com/api"
+SLUG = "https://slug.example.com/api"
+
+
+def _slug_rss(base: str) -> str:
+    """A variant of the sample feed with distinct titles/guids/descriptions."""
+    return (
+        base.replace("Sample One", "Slug One")
+        .replace("Sample Two", "Slug Two")
+        .replace("guid-one", "sguid-one")
+        .replace("guid-two", "sguid-two")
+        .replace("Mon, 02 Oct 2023 12:00:00 GMT", "Wed, 04 Oct 2023 12:00:00 GMT")
+        .replace("Sun, 01 Oct 2023 12:00:00 GMT", "Sat, 30 Sep 2023 12:00:00 GMT")
+    )
+
+
+def _items(response_text: str) -> list:
+    root = etree.fromstring(response_text.encode("utf-8"))
+    return root.findall(".//item")
+
+
+def _guids(response_text: str) -> list[str]:
+    return [element.findtext("guid") for element in _items(response_text)]
+
+
+def _response_total(response_text: str) -> str | None:
+    root = etree.fromstring(response_text.encode("utf-8"))
+    for element in root.iter():
+        local = element.tag.rsplit("}", 1)[-1]
+        if local == "response":
+            return element.get("total")
+    return None
+
+
+# --- authentication and dispatch --------------------------------------------
+
+
+def test_missing_api_key(client):
+    response = client.get(API, params={"t": "search", "q": "ubuntu"})
+
+    assert response.status_code == 200
+    assert 'code="100"' in response.text
+
+
+def test_incorrect_api_key(client):
+    response = client.get(API, params={"t": "caps", "apikey": "nope"})
+
+    assert response.status_code == 200
+    assert 'code="100"' in response.text
+
+
+def test_missing_t_yields_200(client):
+    response = client.get(API, params={"apikey": KEY})
+
+    assert response.status_code == 200
+    assert 'code="200"' in response.text
+
+
+def test_unknown_t_yields_202(client):
+    response = client.get(API, params={"t": "wat", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert 'code="202"' in response.text
+
+
+def test_caps_xml(client):
+    response = client.get(API, params={"t": "caps", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/xml")
+    assert "<caps>" in response.text
+    assert "<searching>" in response.text
+    assert "tv-search" in response.text
+
+
+def test_caps_json(client):
+    response = client.get(API, params={"t": "caps", "apikey": KEY, "o": "json"})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    data = response.json()
+    assert "searching" in data["caps"]
+    assert "search" in data["caps"]["searching"]
+
+
+# --- search aggregation ------------------------------------------------------
+
+
+@respx.mock
+def test_search_aggregates_both_indexers_and_sorts_by_pubdate(client, sample_rss):
+    respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+    respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
+
+    response = client.get(API, params={"t": "search", "q": "ubuntu", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert len(_items(response.text)) == 4
+    assert _response_total(response.text) == "4"
+    # Newest first: slug (04 Oct), geek (02 Oct), geek (01 Oct), slug (30 Sep).
+    assert _guids(response.text) == [
+        "slug:sguid-one",
+        "nzbgeek:guid-one",
+        "nzbgeek:guid-two",
+        "slug:sguid-two",
+    ]
+
+
+@respx.mock
+def test_search_limit_slices_items_but_keeps_total(client, sample_rss):
+    respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+    respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
+
+    response = client.get(API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "limit": "1"})
+
+    assert len(_items(response.text)) == 1
+    assert _response_total(response.text) == "4"
+
+
+@respx.mock
+def test_search_json_shape(client, sample_rss):
+    respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+    respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
+
+    response = client.get(API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "o": "json"})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    data = response.json()
+    assert data["results"]["channel"]["total"] == 4
+    items = data["results"]["channel"]["items"]
+    assert len(items) == 4
+    assert items[0]["guid"] == "slug:sguid-one"
+
+
+@respx.mock
+def test_missing_search_parameter_yields_200(client):
+    response = client.get(API, params={"t": "search", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert 'code="200"' in response.text
+
+
+def test_bad_offset_yields_201(client):
+    response = client.get(API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "offset": "-1"})
+
+    assert response.status_code == 200
+    assert 'code="201"' in response.text
+
+
+# --- caching -----------------------------------------------------------------
+
+
+@respx.mock
+def test_second_identical_search_is_served_from_cache(client, sample_rss):
+    geek = respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+    slug = respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
+
+    params = {"t": "search", "q": "ubuntu", "apikey": KEY}
+    client.get(API, params=params)
+    client.get(API, params=params)
+
+    assert geek.call_count == 1
+    assert slug.call_count == 1
+    metrics = client.get("/metrics").text
+    assert 'stateless_hydra_cache_hits_total{indexer="nzbgeek"} 1.0' in metrics
+
+
+@respx.mock
+def test_different_query_is_a_cache_miss(client, sample_rss):
+    geek = respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+    respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
+
+    client.get(API, params={"t": "search", "q": "ubuntu", "apikey": KEY})
+    client.get(API, params={"t": "search", "q": "debian", "apikey": KEY})
+
+    assert geek.call_count == 2
+
+
+# --- API hit limits ----------------------------------------------------------
+
+
+@respx.mock
+def test_exhausted_indexer_is_skipped_but_other_answers(client, sample_rss):
+    geek = respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+    slug = respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
+
+    for query in ("one", "two", "three"):
+        response = client.get(API, params={"t": "search", "q": query, "apikey": KEY})
+        assert response.status_code == 200
+
+    assert geek.call_count == 2
+    assert slug.call_count == 3
+
+
+@respx.mock
+def test_exhausted_indexer_filtered_alone_yields_910(client, sample_rss):
+    respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+    respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
+
+    for query in ("one", "two"):
+        client.get(API, params={"t": "search", "q": query, "apikey": KEY})
+
+    response = client.get(
+        API, params={"t": "search", "q": "three", "apikey": KEY, "indexer": "nzbgeek"}
+    )
+
+    assert response.status_code == 200
+    assert 'code="910"' in response.text
+
+
+# --- NZB download limits -----------------------------------------------------
+
+
+@respx.mock
+def test_getnzb_succeeds_then_hits_930(client):
+    respx.get(GEEK, params={"t": "getnzb", "id": "xyz"}).mock(
+        return_value=httpx.Response(200, content=b"fake-nzb")
+    )
+
+    first = client.get(API, params={"t": "getnzb", "id": "nzbgeek:xyz", "apikey": KEY})
+
+    assert first.status_code == 200
+    assert first.content == b"fake-nzb"
+    assert first.headers["content-type"] == "application/x-nzb"
+    assert 'filename="xyz.nzb"' in first.headers["content-disposition"]
+
+    second = client.get(API, params={"t": "getnzb", "id": "nzbgeek:xyz", "apikey": KEY})
+
+    assert second.status_code == 200
+    assert 'code="930"' in second.text
+
+
+def test_getnzb_bad_guid_yields_300(client):
+    response = client.get(API, params={"t": "getnzb", "id": "nocolon", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert 'code="300"' in response.text
+
+
+# --- details -----------------------------------------------------------------
+
+
+@respx.mock
+def test_details_is_proxied_verbatim(client):
+    detail_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<rss><channel><item><title>Detail Item</title></item></channel></rss>"
+    )
+    respx.get(GEEK, params={"t": "details", "id": "xyz"}).mock(
+        return_value=httpx.Response(200, text=detail_xml)
+    )
+
+    response = client.get(API, params={"t": "details", "id": "nzbgeek:xyz", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert response.text == detail_xml
+    assert response.headers["content-type"].startswith("application/xml")
+
+
+def test_details_unknown_indexer_yields_300(client):
+    response = client.get(API, params={"t": "details", "id": "ghost:xyz", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert 'code="300"' in response.text
+
+
+# --- upstream errors ---------------------------------------------------------
+
+
+@respx.mock
+def test_failing_indexer_is_skipped(client, sample_rss):
+    respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+    respx.get(SLUG).mock(return_value=httpx.Response(500, text="boom"))
+
+    response = client.get(API, params={"t": "search", "q": "ubuntu", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert _guids(response.text) == ["nzbgeek:guid-one", "nzbgeek:guid-two"]
+    metrics = client.get("/metrics").text
+    assert 'stateless_hydra_indexer_errors_total{indexer="slug"} 1.0' in metrics
+
+
+@respx.mock
+def test_all_indexers_failing_yields_900(client):
+    respx.get(GEEK).mock(return_value=httpx.Response(500, text="boom"))
+    respx.get(SLUG).mock(return_value=httpx.Response(500, text="boom"))
+
+    response = client.get(API, params={"t": "search", "q": "ubuntu", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert 'code="900"' in response.text
+
+
+# --- dedupe ------------------------------------------------------------------
+
+
+@respx.mock
+def test_dedupe_by_title_drops_cross_indexer_duplicates(settings, fake_redis, sample_rss):
+    dedupe_settings = settings.model_copy(update={"dedupe_by_title": True})
+    dedupe_app = create_app(dedupe_settings, redis_client=fake_redis)
+    respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+    respx.get(SLUG).mock(return_value=httpx.Response(200, text=sample_rss))
+
+    with TestClient(dedupe_app) as dedupe_client:
+        response = dedupe_client.get(API, params={"t": "search", "q": "ubuntu", "apikey": KEY})
+
+    assert len(_items(response.text)) == 2
+    assert _response_total(response.text) == "2"
+
+
+# --- metrics and probes ------------------------------------------------------
+
+
+@respx.mock
+def test_metrics_endpoint_exposes_application_metrics(client, sample_rss):
+    respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+    respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
+
+    client.get(API, params={"t": "search", "q": "ubuntu", "apikey": KEY})
+    response = client.get("/metrics")
+
+    assert response.status_code == 200
+    assert "stateless_hydra_" in response.text
+    assert 'stateless_hydra_search_requests_total{function="search"}' in response.text
+
+
+def test_healthz(client):
+    response = client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_readyz_ok(client):
+    response = client.get("/readyz")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready"}
+
+
+def test_readyz_not_ready_when_redis_ping_fails(settings):
+    class BrokenRedis:
+        async def ping(self):
+            raise ConnectionError("redis down")
+
+    broken_app = create_app(settings, redis_client=BrokenRedis())
+
+    with TestClient(broken_app) as broken_client:
+        response = broken_client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "not ready"}
+
+
+def test_unhandled_error_returns_newznab_900(settings, fake_redis):
+    exploding_app = create_app(settings, redis_client=fake_redis)
+
+    class ExplodingCache:
+        async def get(self, *_args, **_kwargs):
+            raise RuntimeError("secret internals")
+
+    exploding_app.state.cache = ExplodingCache()
+
+    with TestClient(exploding_app, raise_server_exceptions=False) as exploding_client:
+        response = exploding_client.get(API, params={"t": "search", "q": "x", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert 'code="900"' in response.text
+    assert "secret internals" not in response.text
+
+
+# --- configuration -----------------------------------------------------------
+
+
+def test_empty_hydra_api_keys_raises_config_error(tmp_path):
+    (tmp_path / "indexers.yaml").write_text(
+        "indexers:\n  - name: ix\n    host: https://ix.example.com\n    apiKeyRef: anything\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "api-keys.yaml").write_text("hydraApiKeys: []\n", encoding="utf-8")
+    settings = AppSettings(
+        indexers_file=str(tmp_path / "indexers.yaml"),
+        api_keys_file=str(tmp_path / "api-keys.yaml"),
+    )
+
+    with pytest.raises(ConfigError):
+        create_app(settings, redis_client=aioredis.FakeRedis())

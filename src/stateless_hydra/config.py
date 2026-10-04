@@ -212,10 +212,16 @@ def resolve_indexer_key(indexer: IndexerConfig, api_keys: ApiKeysFile) -> str:
 
 
 def setup_logging(settings: AppSettings) -> None:
-    """Configure stdlib logging to stderr at ``settings.log_level``."""
+    """Configure stdlib logging to stderr at ``settings.log_level``.
+
+    ``httpx``/``httpcore`` are pinned to ``WARNING``: at ``INFO`` httpx logs the
+    full request URL, which would leak upstream indexer API keys into the logs.
+    """
     logging.basicConfig(
         level=settings.log_level.upper(),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         stream=sys.stderr,
         force=True,
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
