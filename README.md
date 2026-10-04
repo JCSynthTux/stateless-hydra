@@ -98,15 +98,26 @@ Before doing so:
    manage that Secret with External Secrets, SOPS/sealed-secrets, or a cloud
    secret manager. **Never commit real keys.**
 2. Replace the example indexers in `k8s/configmap-indexers.yaml`.
-3. Optionally point `SH_REDIS_URL` in `k8s/deployment.yaml` at a managed Redis
-   and drop `k8s/redis.yaml` (the bundled one is a simple single-replica
-   convenience deployment with no persistence).
+3. Point Redis at your own endpoint by editing `redis_url` in
+   `k8s/configmap-app.yaml` (the Service name in `k8s/redis.yaml` by default).
+   For a managed/external Redis, drop `k8s/redis.yaml` and update that value.
+   Do **not** set `SH_REDIS_URL` on the Deployment unless you intend it to
+   override the ConfigMap.
 
 The Deployment mounts the three config files as read-only sub-paths at
 `/config/app.yaml`, `/config/indexers.yaml` and `/config/api-keys.yaml`,
 runs as non-root with a read-only root filesystem (an `emptyDir` is mounted at
 `/tmp`), and exposes `livenessProbe`/`startupProbe` on `/healthz` and
 `readinessProbe` on `/readyz`.
+
+### Troubleshooting: `/readyz` returns 503
+
+If `/readyz` returns `503` and the logs say `Name or service not known`, the
+app cannot resolve/reach Redis. Check that `redis_url` in the app-config
+ConfigMap (`k8s/configmap-app.yaml`) matches your Redis Service DNS name.
+Remember that `SH_*` environment variables override the config file, so do
+**not** set `SH_REDIS_URL` on the Deployment unless you mean it to win; the
+ConfigMap is the single source of truth in Kubernetes.
 
 ## Configuration reference
 
