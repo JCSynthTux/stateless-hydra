@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## v0.4.2 (2026-10-05)
+
+### Bug Fixes
+
+- **ci**: Split semantic-release tag push with retry to avoid GitHub race
+  ([`5b0e7f1`](https://github.com/JCSynthTux/stateless-hydra/commit/5b0e7f1318f1eeeca2919d59a91754f7d7e4e81a))
+
+
 ## v0.4.1 (2026-10-05)
 
 ### Bug Fixes
