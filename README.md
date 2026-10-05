@@ -170,6 +170,7 @@ Top-level shape: `{ indexers: [ ... ] }`.
 | `searchTypes` | `["search"]` | Any of `search`, `tvsearch`, `movie`, `music`, `book`. |
 | `categories` | `null` (all) | List of Newznab category ids to search. |
 | `proxyUrl` | `null` | Per-indexer proxy; overrides `global_proxy_url` (same supported schemes). |
+| `forceGetnzbRebuild` | `false` | Force the `t=getnzb&id=<guid>` rebuild path even when the guid is a URL. Set `true` when a URL-shaped guid points at a details page rather than the `.nzb` (see [NZB download resolution](#nzb-download-resolution)). |
 
 **Reset semantics.** A fresh daily counter is used for each indexer. The
 counter key includes the current date *in the indexer's `resetTimezone`*, so
@@ -204,6 +205,44 @@ whose pull budget is exhausted, the API responds with Newznab error
 every candidate indexer is out of API-hit budget, it responds with **`910`
 (API hit limit reached)**. Because the counters live in Redis, all replicas
 share one budget — adding pods does not multiply it.
+
+## NZB download resolution
+
+A search result carries a **composed guid** of the form `INDEXER:GUID`. When a
+client requests `t=getnzb&id=INDEXER:GUID`, stateless-hydra resolves the
+download from the owning indexer using this heuristic:
+
+- **Non-URL guid** (for example `xyz` or a plain details id) — the download is
+  rebuilt as `t=getnzb&id=<guid>` against the indexer's Newznab API. This is
+  the normal case for Newznab/Torznab indexers.
+- **URL-shaped guid** (`http://…` / `https://…`) — the URL is fetched
+  **directly**, because some indexers (altHUB among others) advertise the
+  `.nzb` download itself as the guid. Rebuilding that as `t=getnzb` would make
+  the indexer answer "no such function".
+
+The heuristic assumes a URL-shaped guid *is* the NZB. Some indexers instead put
+a **details-page URL** in the guid; fetching it returns HTML, not an NZB. For
+those, set `forceGetnzbRebuild: true` on the indexer. The flag forces the
+`t=getnzb&id=<guid>` rebuild path even for URL-shaped guids, so the download is
+requested from the indexer's API rather than fetched from the guid URL:
+
+```yaml
+indexers:
+  - name: details_page_indexer
+    host: "https://details.example.net"
+    apiKeyRef: "details_page_indexer_key"
+    forceGetnzbRebuild: true   # guid is a details URL, not the .nzb
+```
+
+When **not** to set it: if the guid is a working direct `.nzb` URL (altHUB-style),
+leave the flag at its default `false` so the URL is fetched directly; forcing a
+rebuild there would make the indexer answer "no such function" and break the
+download.
+
+The flag only affects `t=getnzb`. `t=search` and `t=details` are unchanged.
+Upstream Newznab error documents are detected and translated on **both** paths,
+so a misconfigured flag surfaces a clear Newznab error instead of streaming
+HTML or an error body as a fake NZB.
 
 ## Caching
 

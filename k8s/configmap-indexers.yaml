@@ -27,3 +27,7 @@ data:
         cacheTtlSeconds: 900
         searchTypes: ["search", "tvsearch", "movie"]
         categories: [2000, 5000]
+        # false = fetch URL-shaped guids directly (altHUB-style .nzb URLs).
+        # true = always rebuild t=getnzb&id=<guid>; use when a URL-shaped guid
+        # points at a details page instead of the .nzb.
+        forceGetnzbRebuild: false

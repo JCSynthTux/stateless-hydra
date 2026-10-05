@@ -21,6 +21,8 @@
 #   searchTypes      subset of [search, tvsearch, movie, music, book]
 #   categories       list of Newznab category ids; omit for all
 #   proxyUrl         per-indexer proxy override; omit to use global_proxy_url
+#   forceGetnzbRebuild  force t=getnzb&id=<guid> even for URL-shaped guids
+#                       (default: false = fetch URL-shaped guids directly)
 
 indexers:
   # Example 1: a Nexus/Newznab indexer with a realistic daily API-hit budget.
@@ -37,6 +39,7 @@ indexers:
     cacheTtlSeconds: 900               # null = use global cache_ttl_seconds
     searchTypes: ["search", "tvsearch", "movie"]
     categories: [2000, 5000]           # Movies and TV (omit for all)
+    forceGetnzbRebuild: false          # URL-shaped guids are fetched directly
     # proxyUrl: "http://proxy.corp:3128"  # overrides global_proxy_url
 
   # Example 2: a Torznab indexer with a different reset window and its own
@@ -53,5 +56,25 @@ indexers:
     timeoutSeconds: 45
     cacheTtlSeconds: 1800
     searchTypes: ["tvsearch", "movie"]
+    forceGetnzbRebuild: false          # URL-shaped guids are fetched directly
     # categories: [5000, 5040, 2000, 2040]
     proxyUrl: "http://proxy.example.org:8080"
+
+  # Example 3: an indexer whose item guids are URLs pointing at a DETAILS page
+  # (HTML) rather than at the .nzb. With the default (false) stateless-hydra
+  # would fetch that page and stream HTML back as the "NZB". Setting
+  # forceGetnzbRebuild: true makes it rebuild the download as
+  # t=getnzb&id=<guid> against the indexer's Newznab API instead.
+  #
+  # - name: details_page_indexer
+  #   enabled: true
+  #   host: "https://details.example.net"
+  #   apiPath: "/api"
+  #   apiKeyRef: "details_page_indexer_key"
+  #   forceGetnzbRebuild: true         # guid is a details URL, not the NZB
+  #   searchTypes: ["search"]
+  #
+  # The opposite case: an indexer whose guid IS the .nzb URL (altHUB-style)
+  # must leave forceGetnzbRebuild at false (the default) so the URL is fetched
+  # directly. Forcing a rebuild there would make the indexer answer
+  # "no such function" and break the download.
