@@ -21,8 +21,9 @@
 #   searchTypes      subset of [search, tvsearch, movie, music, book]
 #   categories       list of Newznab category ids; omit for all
 #   proxyUrl         per-indexer proxy override; omit to use global_proxy_url
-#   forceGetnzbRebuild  force t=getnzb&id=<guid> even for URL-shaped guids
+#   forceGetnzbRebuild  force the rebuild path even for URL-shaped guids
 #                       (default: false = fetch URL-shaped guids directly)
+#   downloadFunction upstream function for rebuilds: getnzb | get (default: getnzb)
 
 indexers:
   # Example 1: a Nexus/Newznab indexer with a realistic daily API-hit budget.
@@ -40,6 +41,7 @@ indexers:
     searchTypes: ["search", "tvsearch", "movie"]
     categories: [2000, 5000]           # Movies and TV (omit for all)
     forceGetnzbRebuild: false          # URL-shaped guids are fetched directly
+    downloadFunction: getnzb           # standard Newznab download function
     # proxyUrl: "http://proxy.corp:3128"  # overrides global_proxy_url
 
   # Example 2: a Torznab indexer with a different reset window and its own
@@ -57,24 +59,51 @@ indexers:
     cacheTtlSeconds: 1800
     searchTypes: ["tvsearch", "movie"]
     forceGetnzbRebuild: false          # URL-shaped guids are fetched directly
+    downloadFunction: getnzb           # standard Newznab download function
     # categories: [5000, 5040, 2000, 2040]
     proxyUrl: "http://proxy.example.org:8080"
 
-  # Example 3: an indexer whose item guids are URLs pointing at a DETAILS page
-  # (HTML) rather than at the .nzb. With the default (false) stateless-hydra
-  # would fetch that page and stream HTML back as the "NZB". Setting
-  # forceGetnzbRebuild: true makes it rebuild the download as
-  # t=getnzb&id=<guid> against the indexer's Newznab API instead.
+  # Example 3: resolving downloads when an indexer's guids are URLs.
   #
-  # - name: details_page_indexer
+  # stateless-hydra takes the guid from each result. When the RSS marks it
+  # isPermaLink="true" the item's <link> is used as the guid instead (a
+  # permalink guid *is* the link). Two options then decide the download:
+  #
+  #   A. URL-shaped guid that IS the .nzb download (altHUB-style; also nZEDb
+  #      indexers such as drunkenSlug, whose <link> is the .nzb URL). Leave
+  #      both defaults: stateless-hydra fetches the URL directly.
+  #        forceGetnzbRebuild: false
+  #        downloadFunction: getnzb      # unused on this path
+  #
+  #   B. URL-shaped guid that points at a DETAILS page (fetching it returns
+  #      HTML). Force the rebuild path and pick the function the indexer
+  #      implements:
+  #        forceGetnzbRebuild: true
+  #        downloadFunction: getnzb      # or: get, for nZEDb-style indexers
+  #
+  #   C. Non-URL guid (a plain id). The rebuild path is used automatically; set
+  #      downloadFunction: get when the indexer implements only the classic
+  #      Newznab t=get instead of t=getnzb.
+  #
+  # Example: an nZEDb-style indexer that exposes a plain (non-URL) guid and
+  # implements only the classic t=get download function.
+  #
+  # - name: nzedb_indexer
   #   enabled: true
-  #   host: "https://details.example.net"
+  #   host: "https://nzedb.example.net"
   #   apiPath: "/api"
-  #   apiKeyRef: "details_page_indexer_key"
-  #   forceGetnzbRebuild: true         # guid is a details URL, not the NZB
+  #   apiKeyRef: "nzedb_indexer_key"
+  #   downloadFunction: get            # non-URL guid -> rebuild with t=get
   #   searchTypes: ["search"]
   #
   # The opposite case: an indexer whose guid IS the .nzb URL (altHUB-style)
   # must leave forceGetnzbRebuild at false (the default) so the URL is fetched
   # directly. Forcing a rebuild there would make the indexer answer
-  # "no such function" and break the download.
+  # "no such function" and break the download; altHUB also implements t=get,
+  # so downloadFunction is irrelevant while the direct fetch is used.
+  #
+  # Note on drunkenSlug: its RSS marks the guid isPermaLink="true" and its
+  # <link> is the direct .nzb URL, so stateless-hydra already fetches it
+  # directly with the defaults. Do NOT set forceGetnzbRebuild there: the
+  # rebuilt t=get&id=<link> lookup fails with error 300 because nZEDb matches
+  # the release's stored guid, not the download URL.

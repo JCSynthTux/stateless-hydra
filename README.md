@@ -170,7 +170,8 @@ Top-level shape: `{ indexers: [ ... ] }`.
 | `searchTypes` | `["search"]` | Any of `search`, `tvsearch`, `movie`, `music`, `book`. |
 | `categories` | `null` (all) | List of Newznab category ids to search. |
 | `proxyUrl` | `null` | Per-indexer proxy; overrides `global_proxy_url` (same supported schemes). |
-| `forceGetnzbRebuild` | `false` | Force the `t=getnzb&id=<guid>` rebuild path even when the guid is a URL. Set `true` when a URL-shaped guid points at a details page rather than the `.nzb` (see [NZB download resolution](#nzb-download-resolution)). |
+| `forceGetnzbRebuild` | `false` | Force the rebuild path (`t=<downloadFunction>&id=<guid>`) even when the guid is a URL. Set `true` when a URL-shaped guid points at a details page rather than the `.nzb` (see [NZB download resolution](#nzb-download-resolution)). |
+| `downloadFunction` | `getnzb` | Upstream Newznab function used by the rebuild path: `getnzb` (standard) or `get` (classic Newznab, implemented by nZEDb indexers such as drunkenSlug/altHUB). See [NZB download resolution](#nzb-download-resolution). |
 
 **Reset semantics.** A fresh daily counter is used for each indexer. The
 counter key includes the current date *in the indexer's `resetTimezone`*, so
@@ -208,41 +209,58 @@ share one budget — adding pods does not multiply it.
 
 ## NZB download resolution
 
-A search result carries a **composed guid** of the form `INDEXER:GUID`. When a
-client requests `t=getnzb&id=INDEXER:GUID`, stateless-hydra resolves the
-download from the owning indexer using this heuristic:
+A search result carries a **composed guid** of the form `INDEXER:TOKEN`. When a
+client requests `t=getnzb&id=INDEXER:TOKEN`, stateless-hydra resolves the
+download from the owning indexer. Upstream URLs are derived **at search time**
+and stored server-side in Redis under an opaque token, so **no upstream URL —
+and no indexer API key** — is ever sent to the client.
 
-- **Non-URL guid** (for example `xyz` or a plain details id) — the download is
-  rebuilt as `t=getnzb&id=<guid>` against the indexer's Newznab API. This is
-  the normal case for Newznab/Torznab indexers.
-- **URL-shaped guid** (`http://…` / `https://…`) — the URL is fetched
-  **directly**, because some indexers (altHUB among others) advertise the
-  `.nzb` download itself as the guid. Rebuilding that as `t=getnzb` would make
-  the indexer answer "no such function".
+For each result, stateless-hydra derives the upstream download URL:
 
-The heuristic assumes a URL-shaped guid *is* the NZB. Some indexers instead put
-a **details-page URL** in the guid; fetching it returns HTML, not an NZB. For
-those, set `forceGetnzbRebuild: true` on the indexer. The flag forces the
-`t=getnzb&id=<guid>` rebuild path even for URL-shaped guids, so the download is
-requested from the indexer's API rather than fetched from the guid URL:
+- **URL-shaped guid** (`http(s)://…`) with `forceGetnzbRebuild: false`
+  (the default) → the URL *is* the download (altHUB-style `.nzb` URLs, and nZEDb
+  indexers such as drunkenSlug whose permalink `<link>` is the `.nzb` URL).
+- **Otherwise** → the download is rebuilt as
+  `t=<downloadFunction>&id=<guid>` against the indexer's API.
+
+The derived URL is stored at `stateless_hydra:nzb:{token}` (JSON
+`{"indexer":…,"url":…}`) with a **14-day TTL**, and the client-facing guid
+becomes `{indexer}:{token}`. `t=getnzb` looks the token up in Redis, verifies it
+belongs to the named indexer, and fetches the stored URL. Missing, expired or
+mismatched tokens return Newznab error `300`. Because tokens live in the shared
+Redis, **Redis is required for downloads** (as it already is for the cache and
+daily limits) and any replica can serve any token.
+
+**How the guid is chosen.** stateless-hydra takes the guid from the indexer's
+RSS. When the RSS marks it `isPermaLink="true"`, the item's `<link>` is used as
+the guid instead (a permalink guid *is* the link).
+
+| Indexer / guid shape | `forceGetnzbRebuild` | `downloadFunction` | Upstream URL |
+| --- | --- | --- | --- |
+| altHUB-style: guid is the `.nzb` URL | `false` (default) | `getnzb` (default, unused) | the guid, fetched directly |
+| drunkenSlug-style: `isPermaLink="true"`, `<link>` is the `.nzb` URL | `false` (default) | `getnzb` (default, unused) | the substituted `<link>`, fetched directly |
+| details-page URL guid without a usable `.nzb` link | `true` | `get` (nZEDb classic) or `getnzb` | `t=<downloadFunction>&id=<guid>` |
+| Non-URL (plain id) | ignored | `getnzb` default, or `get` | `t=<downloadFunction>&id=<guid>` |
+
+Use `downloadFunction: get` for an nZEDb-style indexer that implements only the
+classic `t=get` and exposes a plain (non-URL) guid:
 
 ```yaml
 indexers:
-  - name: details_page_indexer
-    host: "https://details.example.net"
-    apiKeyRef: "details_page_indexer_key"
-    forceGetnzbRebuild: true   # guid is a details URL, not the .nzb
+  - name: nzedb_indexer
+    host: "https://nzedb.example.net"
+    apiKeyRef: "nzedb_indexer_key"
+    downloadFunction: get      # rebuild non-URL guids with t=get
 ```
 
-When **not** to set it: if the guid is a working direct `.nzb` URL (altHUB-style),
-leave the flag at its default `false` so the URL is fetched directly; forcing a
-rebuild there would make the indexer answer "no such function" and break the
-download.
+A details-page URL guid (fetching it returns HTML) needs
+`forceGetnzbRebuild: true`; pick `downloadFunction` for the function the indexer
+implements (`get` for nZEDb classic, `getnzb` otherwise).
 
-The flag only affects `t=getnzb`. `t=search` and `t=details` are unchanged.
-Upstream Newznab error documents are detected and translated on **both** paths,
-so a misconfigured flag surfaces a clear Newznab error instead of streaming
-HTML or an error body as a fake NZB.
+Tokens expire after 14 days: re-run a search to get a fresh download link if a
+client kept an old one. Upstream Newznab error documents are detected and
+translated on the resolution path, so a misconfigured option surfaces a clear
+Newznab error instead of streaming HTML or an error body as a fake NZB.
 
 ## Caching
 
