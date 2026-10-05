@@ -14,6 +14,7 @@ unit-tested without any external service.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -223,6 +224,53 @@ def render_error(code: int, description: str | None = None) -> str:
         description = ERROR_CODES[code]
     element = etree.Element("error", code=str(code), description=description)
     return etree.tostring(element, encoding="unicode") + "\n"
+
+
+# Opening tag of a Newznab error document and its individual attributes; the
+# attributes may appear in either quote style and any order.
+_ERROR_OPEN = re.compile(r"<error\b[^>]*>", re.IGNORECASE)
+_ERROR_ATTR = re.compile(
+    r"\b(?P<name>code|description)\s*=\s*(?P<quote>[\"'])(?P<value>.*?)(?P=quote)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def parse_upstream_error(body: bytes | str) -> tuple[int, str | None] | None:
+    """Extract ``(code, description)`` from an upstream Newznab error document.
+
+    Indexers sometimes answer a ``details``/``getnzb`` request with HTTP 200
+    and an ``<error code="..." description="..."/>`` body rather than the
+    requested payload (for example altHUB's ``t=getnzb`` replies with code
+    ``202``). Proxying that through as if it were a real document would hide
+    the failure from clients, so callers inspect bodies with this function and
+    re-raise the upstream error.
+
+    Returns ``None`` when ``body`` is not a Newznab error document. ``code``
+    is required; an unparseable code falls back to ``900``.
+    """
+    text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body
+    stripped = text.lstrip()
+    # Indexers commonly prepend an XML declaration (altHUB does), so tolerate
+    # one before looking for the root ``<error>`` element.
+    if stripped.startswith("<?xml"):
+        declaration_end = stripped.find("?>")
+        if declaration_end != -1:
+            stripped = stripped[declaration_end + 2 :].lstrip()
+    opening = _ERROR_OPEN.match(stripped)
+    if opening is None:
+        return None
+    attributes = {
+        match.group("name").lower(): match.group("value")
+        for match in _ERROR_ATTR.finditer(opening.group(0))
+    }
+    if "code" not in attributes:
+        return None
+    try:
+        code = int(attributes["code"])
+    except ValueError:
+        code = 900
+    description = attributes.get("description") or None
+    return code, description
 
 
 def _category_tree() -> list[tuple[int, str, list[tuple[int, str]]]]:

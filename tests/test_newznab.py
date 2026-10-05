@@ -18,6 +18,7 @@ from stateless_hydra.newznab import (
     canonical_query,
     compose_guid,
     parse_indexer_rss,
+    parse_upstream_error,
     render_caps,
     render_error,
     render_results,
@@ -129,6 +130,40 @@ def test_render_error_unknown_code_normalizes_to_900():
     assert render_error(9999) == '<error code="900" description="Unknown error"/>\n'
     # A caller-supplied description is preserved, matching NewznabError.
     assert render_error(9999, "custom") == '<error code="900" description="custom"/>\n'
+
+
+# --- parse_upstream_error ---------------------------------------------------
+
+
+def test_parse_upstream_error_reads_code_and_description():
+    assert parse_upstream_error('<error code="202" description="No such function"/>') == (
+        202,
+        "No such function",
+    )
+
+
+def test_parse_upstream_error_accepts_bytes_and_xml_declaration():
+    body = (
+        b'<?xml version="1.0" encoding="UTF-8"?>\n'
+        b'<error code="202" description="No such function"/>'
+    )
+    assert parse_upstream_error(body) == (202, "No such function")
+
+
+def test_parse_upstream_error_single_quotes_and_reordered_attributes():
+    assert parse_upstream_error("<error description='gone' code='300'/>") == (300, "gone")
+
+
+def test_parse_upstream_error_unparseable_code_falls_back_to_900():
+    assert parse_upstream_error('<error code="abc" description="weird"/>') == (900, "weird")
+
+
+def test_parse_upstream_error_non_error_documents_return_none():
+    assert parse_upstream_error("<rss><channel/></rss>") is None
+    assert parse_upstream_error(b"PK\x03\x04fake-nzb") is None
+    assert parse_upstream_error("") is None
+    # ``<error>`` without attributes is not a usable Newznab error document.
+    assert parse_upstream_error("<error/>") is None
 
 
 # --- render_caps ------------------------------------------------------------

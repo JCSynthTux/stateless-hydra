@@ -431,6 +431,92 @@ def test_getnzb_missing_id_yields_200(client):
     assert 'code="200"' in response.text
 
 
+@respx.mock
+def test_getnzb_fetches_url_shaped_guid_directly(client):
+    # altHUB (and similar indexers) advertise the download itself as the guid:
+    # a full URL with query parameters. Rebuilding that as t=getnzb&id=<url>
+    # makes the indexer answer "no such function", so the URL must be fetched
+    # verbatim instead.
+    url_guid = "https://api.althub.co.za/getnzb/abc.nzb&i=1&r=2"
+    rss = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<rss version="2.0" xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/">'
+        "<channel><title>Sample</title>"
+        '<newznab:response offset="0" total="1"/>'
+        "<item>"
+        "<title>URL Guid Item</title>"
+        '<guid isPermaLink="false">https://api.althub.co.za/getnzb/abc.nzb&amp;i=1&amp;r=2</guid>'
+        "<link>https://api.althub.co.za/details/abc</link>"
+        "<pubDate>Mon, 02 Oct 2023 12:00:00 GMT</pubDate>"
+        "<category>5040</category>"
+        "<size>123456</size>"
+        "</item></channel></rss>"
+    )
+    # search serves the feed with the URL guid; any t=getnzb request would be
+    # the bug being fixed, so record it and never serve it.
+    newznab_route = respx.get(GEEK, params={"t": "getnzb"}).mock(
+        return_value=httpx.Response(200, content=b"wrong-route")
+    )
+    respx.get(GEEK, params={"t": "search"}).mock(return_value=httpx.Response(200, text=rss))
+    respx.get(SLUG).mock(return_value=httpx.Response(200, text="<rss><channel/></rss>"))
+    direct = respx.get(url_guid).mock(return_value=httpx.Response(200, content=b"direct-nzb"))
+
+    search = client.get(
+        API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek"}
+    )
+    enclosure = _enclosures(search.text)[0]
+    guid = dict(httpx.URL(enclosure.get("url")).params)["id"]
+    assert guid == f"nzbgeek:{url_guid}"
+
+    url = httpx.URL(enclosure.get("url"))
+    response = client.get(url.path, params=dict(url.params))
+
+    assert response.status_code == 200
+    assert response.content == b"direct-nzb"
+    assert response.headers["content-type"] == "application/x-nzb"
+    assert direct.call_count == 1
+    assert newznab_route.call_count == 0
+
+
+@respx.mock
+def test_getnzb_direct_url_upstream_error_xml_is_not_streamed(client):
+    # A 200 body that is actually a Newznab error document must surface as our
+    # own error, never as an application/x-nzb stream.
+    url_guid = "https://api.althub.co.za/getnzb/abc.nzb&i=1&r=2"
+    respx.get(url_guid).mock(
+        return_value=httpx.Response(
+            200,
+            content=b'<?xml version="1.0"?>\n<error code="202" description="No such function"/>',
+            headers={"content-type": "text/xml"},
+        )
+    )
+
+    response = client.get(
+        API,
+        params={"t": "getnzb", "id": f"nzbgeek:{url_guid}", "apikey": KEY},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/xml")
+    assert 'code="202"' in response.text
+    assert "No such function" in response.text
+    assert response.content != b"direct-nzb"
+
+
+@respx.mock
+def test_getnzb_legacy_non_url_guid_still_uses_newznab_route(client):
+    route = respx.get(GEEK, params={"t": "getnzb", "id": "xyz"}).mock(
+        return_value=httpx.Response(200, content=b"legacy-nzb")
+    )
+
+    response = client.get(API, params={"t": "getnzb", "id": "nzbgeek:xyz", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert response.content == b"legacy-nzb"
+    assert response.headers["content-type"] == "application/x-nzb"
+    assert route.call_count == 1
+
+
 # --- details -----------------------------------------------------------------
 
 
@@ -481,6 +567,21 @@ def test_details_404_yields_300(client):
 
     assert response.status_code == 200
     assert 'code="300"' in response.text
+
+
+@respx.mock
+def test_details_200_upstream_error_xml_surfaces_its_code(client):
+    respx.get(GEEK, params={"t": "details", "id": "xyz"}).mock(
+        return_value=httpx.Response(
+            200, content=b'<?xml version="1.0"?>\n<error code="300" description="No such item"/>'
+        )
+    )
+
+    response = client.get(API, params={"t": "details", "id": "nzbgeek:xyz", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert 'code="300"' in response.text
+    assert "No such item" in response.text
 
 
 def test_details_missing_id_yields_200(client):

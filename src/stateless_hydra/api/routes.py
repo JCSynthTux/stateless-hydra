@@ -36,6 +36,7 @@ from ..newznab import (
     canonical_query,
     compose_guid,
     parse_indexer_rss,
+    parse_upstream_error,
     render_caps,
     render_error,
     render_results,
@@ -351,7 +352,13 @@ async def _handle_details(request: Request) -> Response:
         raise NewznabError(900) from None
 
     if response.status_code >= 400:
+        upstream_error = parse_upstream_error(response.content)
+        if upstream_error is not None:
+            raise NewznabError(*upstream_error)
         raise NewznabError(300 if response.status_code == 404 else 900)
+    upstream_error = parse_upstream_error(response.content)
+    if upstream_error is not None:
+        raise NewznabError(*upstream_error)
     return Response(content=response.content, media_type=XML_MEDIA_TYPE)
 
 
@@ -378,11 +385,27 @@ async def _handle_getnzb(request: Request) -> Response:
     metrics.inc_nzb_pull(indexer_name)
 
     try:
-        response = await client.fetch(client.build_url({"t": "getnzb", "id": original_guid}))
+        if original_guid.startswith(("http://", "https://")):
+            # URL-shaped guids (altHUB among others) are already complete
+            # download URLs; rebuilding them as t=getnzb would make the
+            # indexer answer "no such function". Fetch the URL directly,
+            # matching how the indexer advertises the download.
+            response = await client.fetch(original_guid)
+        else:
+            response = await client.fetch(client.build_url({"t": "getnzb", "id": original_guid}))
     except IndexerError:
         logger.warning("indexer %s getnzb failed", indexer_name, exc_info=True)
         metrics.inc_error(indexer_name)
         raise NewznabError(900) from None
+
+    # An indexer may answer 200 (or an error status) with a Newznab error
+    # document instead of an NZB. Surface its code/description rather than
+    # streaming the error body as a fake NZB.
+    upstream_error = parse_upstream_error(response.content)
+    if upstream_error is not None:
+        logger.warning("indexer %s getnzb returned error %s", indexer_name, upstream_error[0])
+        metrics.inc_error(indexer_name)
+        raise NewznabError(*upstream_error)
 
     if response.status_code >= 400:
         raise NewznabError(300 if response.status_code == 404 else 900)
