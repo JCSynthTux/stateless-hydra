@@ -1,6 +1,24 @@
 # CHANGELOG
 
 
+## v0.3.1 (2026-10-05)
+
+### Bug Fixes
+
+- **newznab**: Carry indexer-reported size into items and nzb enclosures
+  ([`def49de`](https://github.com/JCSynthTux/stateless-hydra/commit/def49de0d85b558f4bc014f3973992cfa46695fd))
+
+Classic nZEDb/Newznab indexers such as drunkenSlug report the release size only as a torznab/newznab
+  ``size`` attribute, never as a ``<size>`` element. The parser read only the element, so
+  ``ResultItem.size`` stayed None, the rendered ``<enclosure>`` omitted ``length``, and newznab
+  clients (AIOStreams' NEWZNAB profile keeps ``size``) saw size 0.
+
+Read the size from the ``size`` attribute as a fallback and add an API regression test that runs a
+  small port of AIOStreams' newznab drop rules (title required, enclosure with a type containing
+  "nzb" required) over a search response, asserts every rendered item survives, and follows the
+  advertised enclosure through the Redis token store.
+
+
 ## v0.3.0 (2026-10-05)
 
 ### Chores
