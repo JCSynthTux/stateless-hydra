@@ -1,6 +1,22 @@
 # CHANGELOG
 
 
+## v0.4.0 (2026-10-05)
+
+### Documentation
+
+- Document Prometheus and Grafana monitoring setup
+  ([`3dfb3ac`](https://github.com/JCSynthTux/stateless-hydra/commit/3dfb3ac15bbc1f05d1f1abc22d25a10d735c6fa0))
+
+### Features
+
+- **deploy**: Add Prometheus ServiceMonitor manifest
+  ([`336fa79`](https://github.com/JCSynthTux/stateless-hydra/commit/336fa79cc466ed71c20afe98395a5c9801b31c85))
+
+- **observability**: Add Grafana dashboard for stateless-hydra metrics
+  ([`e0453a2`](https://github.com/JCSynthTux/stateless-hydra/commit/e0453a2c81e9b8f7b6347e7bbf3cd8439002eb40))
+
+
 ## v0.3.5 (2026-10-05)
 
 ### Performance Improvements
