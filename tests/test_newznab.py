@@ -184,6 +184,16 @@ def test_render_caps_xml_is_well_formed_with_expected_structure():
     assert root.find("categories") is not None
 
 
+def test_render_caps_appversion_tracks_package_version():
+    # Pin the caps ``server`` element to the runtime ``__version__`` so a
+    # semantic-release bump can never silently leave clients with a stale
+    # appversion (the value is no longer a hardcoded literal).
+    server = _parse(render_caps({"search"})).find("server")
+
+    assert server is not None
+    assert server.get("appversion") == __version__
+
+
 def test_render_caps_unknown_search_type_raises_value_error():
     with pytest.raises(ValueError, match="unknown search type"):
         render_caps({"search", "bogus"})
