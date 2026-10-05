@@ -1,6 +1,31 @@
 # CHANGELOG
 
 
+## v0.3.4 (2026-10-05)
+
+### Bug Fixes
+
+- **api**: Strip tt prefix from imdbid before forwarding to indexers
+  ([`84e56db`](https://github.com/JCSynthTux/stateless-hydra/commit/84e56dbb9d7f957a5e7885daf595f29603d9b16d))
+
+Clients (Radarr, Sonarr, AIOStreams) send the canonical tt-prefixed IMDb id, but Newznab's
+  movie-search spec documents the numeric form and nZEDb-based indexers such as miatrix compare the
+  value verbatim. A tt-prefixed imdbid matched nothing, so miatrix answered movie searches with an
+  empty feed. Strip a leading case-insensitive tt (as nzbhydra2 does in
+  Newznab.extendQueryUrlWithSearchIds) while preserving any leading zeros.
+
+- **api**: Surface upstream error XML as indexer errors instead of silent zero results
+  ([`847f20a`](https://github.com/JCSynthTux/stateless-hydra/commit/847f20aa4f3cada276b99c63ab893a33495fd9a2))
+
+Indexers such as nZEDb-based miatrix answer a failed search with HTTP 200 and a Newznab <error
+  code=... description=.../> body. That document has no channel, so parse_indexer_rss turned it into
+  a valid-but-empty feed: the indexer looked like a successful search with no matches, no warning
+  was logged and no error metric moved. Detect the upstream error document in the search parse path
+  so the indexer is skipped, a WARNING with the code/description is logged, the error counter is
+  incremented and the body is not cached. A genuinely empty feed (total="0") is still treated as a
+  successful search.
+
+
 ## v0.3.3 (2026-10-05)
 
 ### Bug Fixes
