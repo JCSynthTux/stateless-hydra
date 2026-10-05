@@ -433,6 +433,56 @@ def test_parse_indexer_rss_missing_optional_fields_default_to_none():
     assert second.attributes == {"seeders": "5"}
 
 
+def test_parse_indexer_rss_reads_size_from_attr_when_size_element_absent():
+    # Classic nZEDb/Newznab indexers (drunkenSlug) omit <size> and report it
+    # only as a torznab/newznab ``size`` attribute. Dropping it left item.size
+    # unset, so the rendered enclosure had no length and AIOStreams' newznab
+    # profile saw size 0.
+    rss = """<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"
+         xmlns:torznab="http://torznab.com/schemas/2015/feed">
+      <channel>
+        <newznab:response xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/"
+                          offset="0" total="1"/>
+        <item>
+          <title>Some.Release.1080p</title>
+          <guid isPermaLink="false">abc123</guid>
+          <link>https://indexer.invalid/getnzb/abc123.nzb</link>
+          <pubDate>Sun, 04 Oct 2026 12:00:00 +0000</pubDate>
+          <category>2040</category>
+          <torznab:attr name="size" value="2688419601"/>
+        </item>
+      </channel>
+    </rss>
+    """
+
+    item = parse_indexer_rss(rss).items[0]
+
+    assert item.size == 2688419601
+    assert item.attributes == {"size": "2688419601"}
+
+
+def test_parse_indexer_rss_prefers_size_element_over_attr():
+    rss = """<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"
+         xmlns:torznab="http://torznab.com/schemas/2015/feed">
+      <channel>
+        <item>
+          <title>Some.Release.1080p</title>
+          <guid>abc123</guid>
+          <link>https://indexer.invalid/getnzb/abc123.nzb</link>
+          <pubDate>Sun, 04 Oct 2026 12:00:00 +0000</pubDate>
+          <category>2040</category>
+          <size>100</size>
+          <torznab:attr name="size" value="999"/>
+        </item>
+      </channel>
+    </rss>
+    """
+
+    assert parse_indexer_rss(rss).items[0].size == 100
+
+
 def test_parse_indexer_rss_uses_link_when_guid_is_permalink():
     rss = """<?xml version="1.0" encoding="UTF-8"?>
     <rss version="2.0">

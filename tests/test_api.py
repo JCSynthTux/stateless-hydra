@@ -54,6 +54,31 @@ def _enclosures(response_text: str) -> list:
     return [item.find("enclosure") for item in _items(response_text)]
 
 
+def _aiostreams_surviving_items(response_text: str) -> list:
+    """Port of AIOStreams' newznab item rules (scanner + ``getEnclosure``).
+
+    AIOStreams' byte scanner drops an item with no title, and its newznab addon
+    drops every item whose enclosure list has no entry whose ``type`` contains
+    ``"nzb"`` (``if (!nzbUrl) continue;``). A feed can therefore carry a correct
+    channel total while zero items survive -- the exact "totalResults N, no
+    streams" signature. This mirrors both rules so a regression fails loudly.
+    """
+    surviving = []
+    for item in _items(response_text):
+        title = (item.findtext("title") or "").strip()
+        if not title:
+            continue
+        enclosure = item.find("enclosure")
+        if enclosure is None:
+            continue
+        if "nzb" not in (enclosure.get("type") or "").lower():
+            continue
+        if not enclosure.get("url"):
+            continue
+        surviving.append(item)
+    return surviving
+
+
 def _response_total(response_text: str) -> str | None:
     root = etree.fromstring(response_text.encode("utf-8"))
     for element in root.iter():
@@ -221,6 +246,50 @@ def test_search_items_carry_nzb_enclosure_pointing_at_our_getnzb(client, sample_
     assert "https://" not in params["id"]
     assert "r=" not in params["id"]
     assert "i=" not in params["id"]
+
+
+@respx.mock
+def test_search_items_survive_aiostreams_newznab_rules_and_enclosure_grabs(client, sample_rss):
+    # Regression guard for the AIOStreams 0-stream signature: a correct
+    # envelope total with zero surviving items. Every rendered item must carry
+    # a title and an ``application/x-nzb`` enclosure, the enclosure URL must
+    # point at our own getnzb endpoint carrying the composed token guid, and
+    # following that enclosure must return the NZB through the Redis token
+    # store (never the upstream URL).
+    def _geek(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("t") == "getnzb":
+            return httpx.Response(200, content=b"real-nzb")
+        return httpx.Response(200, text=sample_rss)
+
+    respx.get(GEEK).mock(side_effect=_geek)
+
+    search = client.get(
+        API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek"}
+    )
+
+    items = _items(search.text)
+    assert len(items) == 2
+    assert len(_aiostreams_surviving_items(search.text)) == len(items)
+
+    for item in items:
+        enclosure = item.find("enclosure")
+        assert enclosure is not None
+        assert enclosure.get("type") == "application/x-nzb"
+        url = httpx.URL(enclosure.get("url"))
+        params = dict(url.params)
+        assert url.path == API
+        assert params["t"] == "getnzb"
+        # The enclosure advertises the composed guid (indexer:token), which is
+        # also the item's guid and never the upstream guid.
+        assert params["id"] == item.findtext("guid")
+        assert params["id"].startswith("nzbgeek:")
+        assert params["apikey"] == KEY
+        assert "https://" not in params["id"]
+
+    download = _follow_enclosure(client, search.text)
+    assert download.status_code == 200
+    assert download.headers["content-type"] == "application/x-nzb"
+    assert download.content == b"real-nzb"
 
 
 @respx.mock

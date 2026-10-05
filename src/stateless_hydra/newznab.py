@@ -502,13 +502,22 @@ def _parse_item(element: etree._Element) -> ResultItem:
     enclosure_el = _child(element, "enclosure")
     enclosure_url = enclosure_el.get("url") if enclosure_el is not None else None
 
+    # Classic nZEDb/Newznab indexers (drunkenSlug among them) carry the size
+    # only as an ``attr`` rather than a dedicated ``<size>`` element. Read it
+    # from either so the rendered enclosure can advertise ``length`` (and
+    # clients such as AIOStreams, whose newznab profile keeps ``size``, see a
+    # non-zero size instead of 0).
+    size = _int_or_none(_text(_child(element, "size")))
+    if size is None:
+        size = _int_or_none(attributes.get("size"))
+
     return ResultItem(
         title=title,
         guid=guid,
         link=link,
         pub_date=pub_date,
         category=category,
-        size=_int_or_none(_text(_child(element, "size"))),
+        size=size,
         description=_text(_child(element, "description")),
         enclosure_url=enclosure_url,
         attributes=attributes,
