@@ -22,6 +22,7 @@ API = "/api"
 KEY = "test-key"
 GEEK = "https://nzbgeek.example.com/api"
 SLUG = "https://slug.example.com/api"
+DETAILSURL = "https://detailsurl.example.com/api"
 
 
 def _slug_rss(base: str) -> str:
@@ -515,6 +516,53 @@ def test_getnzb_legacy_non_url_guid_still_uses_newznab_route(client):
     assert response.content == b"legacy-nzb"
     assert response.headers["content-type"] == "application/x-nzb"
     assert route.call_count == 1
+
+
+@respx.mock
+def test_getnzb_force_rebuild_uses_newznab_route_for_url_guid(client):
+    # detailsurl's guids are URLs pointing at a details page, so direct-fetching
+    # them returns HTML. forceGetnzbRebuild: true makes us rebuild
+    # t=getnzb&id=<url-guid> against the indexer instead of fetching the guid.
+    url_guid = "https://detailsurl.example.com/details/abc"
+    rebuilt = respx.get(DETAILSURL, params={"t": "getnzb", "id": url_guid}).mock(
+        return_value=httpx.Response(200, content=b"rebuilt-nzb")
+    )
+    direct = respx.get(url_guid).mock(return_value=httpx.Response(200, content=b"<html>"))
+
+    response = client.get(
+        API, params={"t": "getnzb", "id": f"detailsurl:{url_guid}", "apikey": KEY}
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"rebuilt-nzb"
+    assert response.headers["content-type"] == "application/x-nzb"
+    assert rebuilt.call_count == 1
+    assert direct.call_count == 0
+
+
+@respx.mock
+def test_getnzb_force_rebuild_upstream_error_xml_is_translated(client):
+    # The upstream-error detection must stay active on the rebuild path too: a
+    # 200 Newznab error document is surfaced as our own error, not streamed.
+    url_guid = "https://detailsurl.example.com/details/abc"
+    respx.get(DETAILSURL, params={"t": "getnzb", "id": url_guid}).mock(
+        return_value=httpx.Response(
+            200,
+            content=b'<?xml version="1.0"?>\n<error code="202" description="No such function"/>',
+            headers={"content-type": "text/xml"},
+        )
+    )
+    direct = respx.get(url_guid).mock(return_value=httpx.Response(200, content=b"<html>"))
+
+    response = client.get(
+        API, params={"t": "getnzb", "id": f"detailsurl:{url_guid}", "apikey": KEY}
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/xml")
+    assert 'code="202"' in response.text
+    assert "No such function" in response.text
+    assert direct.call_count == 0
 
 
 # --- details -----------------------------------------------------------------

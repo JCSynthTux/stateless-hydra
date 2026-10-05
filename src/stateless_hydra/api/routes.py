@@ -375,6 +375,7 @@ async def _handle_getnzb(request: Request) -> Response:
     indexer_name, original_guid = split
     if not _enabled_owner(request, indexer_name):
         raise NewznabError(300, "No such item")
+    owner = app.state.indexers[indexer_name]
     client = app.state.clients[indexer_name]
 
     allowed = await app.state.limits.consume(indexer_name, LimitKind.NZB)
@@ -385,11 +386,13 @@ async def _handle_getnzb(request: Request) -> Response:
     metrics.inc_nzb_pull(indexer_name)
 
     try:
-        if original_guid.startswith(("http://", "https://")):
+        if original_guid.startswith(("http://", "https://")) and not owner.force_getnzb_rebuild:
             # URL-shaped guids (altHUB among others) are already complete
             # download URLs; rebuilding them as t=getnzb would make the
             # indexer answer "no such function". Fetch the URL directly,
-            # matching how the indexer advertises the download.
+            # matching how the indexer advertises the download. Indexers whose
+            # URL-shaped guid points at a details page instead opt out with
+            # forceGetnzbRebuild: true, which forces the rebuild path below.
             response = await client.fetch(original_guid)
         else:
             response = await client.fetch(client.build_url({"t": "getnzb", "id": original_guid}))

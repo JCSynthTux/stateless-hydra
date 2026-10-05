@@ -31,6 +31,7 @@ indexers:
     searchTypes: [search, tvsearch]
     categories: [2000, 5000]
     proxyUrl: http://proxy.corp:3128
+    forceGetnzbRebuild: true
 """
 
 MINIMAL_INDEXERS_YAML = """
@@ -122,6 +123,26 @@ def test_full_indexers_yaml_loads_all_fields(tmp_path):
     assert indexer.search_types == ["search", "tvsearch"]
     assert indexer.categories == [2000, 5000]
     assert indexer.proxy_url == "http://proxy.corp:3128"
+    assert indexer.force_getnzb_rebuild is True
+
+
+def test_force_getnzb_rebuild_defaults_false(tmp_path):
+    path = _write(tmp_path, "indexers.yaml", MINIMAL_INDEXERS_YAML)
+    indexer = load_indexers(path)[0]
+
+    assert indexer.force_getnzb_rebuild is False
+
+
+def test_force_getnzb_rebuild_alias_parses(tmp_path):
+    path = _write(
+        tmp_path,
+        "indexers.yaml",
+        "indexers:\n  - name: flagged\n    host: https://api.example.invalid\n"
+        "    apiKeyRef: flagged\n    forceGetnzbRebuild: true\n",
+    )
+    indexer = load_indexers(path)[0]
+
+    assert indexer.force_getnzb_rebuild is True
 
 
 def test_indexer_defaults_applied(tmp_path):
@@ -139,6 +160,7 @@ def test_indexer_defaults_applied(tmp_path):
     assert indexer.search_types == ["search"]
     assert indexer.categories is None
     assert indexer.proxy_url is None
+    assert indexer.force_getnzb_rebuild is False
 
 
 def test_unknown_top_level_keys_are_ignored(tmp_path):

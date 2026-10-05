@@ -53,6 +53,9 @@ class IndexerConfig(BaseModel):
     timeout_seconds: float = Field(default=30.0, alias="timeoutSeconds", gt=0)
     # None -> global default; <=0 -> disabled
     cache_ttl_seconds: int | None = Field(default=None, alias="cacheTtlSeconds")
+    # True -> always rebuild t=getnzb&id=<guid>, even for URL-shaped guids.
+    # False -> fetch URL-shaped guids directly (altHUB-style .nzb URLs).
+    force_getnzb_rebuild: bool = Field(default=False, alias="forceGetnzbRebuild")
     search_types: list[str] = Field(default_factory=lambda: ["search"], alias="searchTypes")
     categories: list[int] | None = Field(default=None, alias="categories")  # None -> all
     proxy_url: str | None = Field(default=None, alias="proxyUrl")  # per-indexer override
