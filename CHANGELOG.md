@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## v0.3.5 (2026-10-05)
+
+### Performance Improvements
+
+- **api**: Query indexers concurrently to cut search latency
+  ([`3bbc481`](https://github.com/JCSynthTux/stateless-hydra/commit/3bbc48196265d5e3336fd2498c64329609276011))
+
+
 ## v0.3.4 (2026-10-05)
 
 ### Bug Fixes
