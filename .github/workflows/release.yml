@@ -68,6 +68,19 @@ jobs:
         # GHCR rejects uppercase repository names, so lowercase
         # GITHUB_REPOSITORY (e.g. "Owner/Repo" -> "owner/repo") before use.
         run: echo "name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - name: Compute image tags
+        id: tags
+        shell: bash
+        # This job runs on a branch push (main), so docker/metadata-action's
+        # `type=semver` cannot derive a version (it needs a tag ref). Derive the
+        # explicit tags from the tag semantic-release reported instead.
+        env:
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          V="${TAG#v}"
+          echo "version=v${V}" >> "$GITHUB_OUTPUT"
+          echo "major_minor=${V%.*}" >> "$GITHUB_OUTPUT"
+          echo "major=${V%%.*}" >> "$GITHUB_OUTPUT"
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
       - name: Set up Buildx
@@ -76,12 +89,12 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
+          # metadata-action is kept ONLY for the OCI labels below. The actual
+          # image tags are computed explicitly in the "Compute image tags" step
+          # (semver derivation needs a tag ref, which this branch-push job lacks).
           images: ghcr.io/${{ steps.image-name.outputs.name }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=sha
+            type=ref,event=branch
       # NOTE: pushing to GHCR requires the repository setting
       # "Workflow permissions -> Read and write" to be enabled (Settings ->
       # Actions -> General) so GITHUB_TOKEN carries packages: write.
@@ -97,5 +110,9 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: |
+            ghcr.io/${{ steps.image-name.outputs.name }}:${{ steps.tags.outputs.version }}
+            ghcr.io/${{ steps.image-name.outputs.name }}:${{ steps.tags.outputs.major_minor }}
+            ghcr.io/${{ steps.image-name.outputs.name }}:${{ steps.tags.outputs.major }}
+            ghcr.io/${{ steps.image-name.outputs.name }}:latest
           labels: ${{ steps.meta.outputs.labels }}
