@@ -22,7 +22,7 @@ name: Release
 # "missing necessary objects" (the server has not yet made the new commit
 # reachable for the tag). We therefore install the PSR CLI and split the flow:
 # `version --no-push --no-vcs-release` -> push commit -> retry-push tag ->
-# `publish` (GitHub Release).
+# create the GitHub Release from the generated changelog.
 on:
   push:
     branches: [main]
@@ -108,7 +108,7 @@ jobs:
           done
           echo "Failed to push tag ${TAG} after 5 attempts" >&2
           exit 1
-      - name: Publish GitHub release
+      - name: Create GitHub release
         if: steps.release.outputs.released == 'true'
         shell: bash
         env:
@@ -116,8 +116,24 @@ jobs:
           TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
-          # Creates the GitHub Release + notes for the (now pushed) tag.
-          semantic-release publish --tag "${TAG}"
+          # NOTE: `semantic-release publish` only uploads distribution assets to
+          # an *existing* VCS release; it does not create one. And `version
+          # --no-push` cannot create it either (PSR disables the VCS release
+          # whenever it does not push, see version.py `make_vcs_release &=
+          # push_changes`). Since we deliberately defer the tag push so it can be
+          # retried, create the release here from the CHANGELOG section PSR just
+          # generated for this tag.
+          version="${TAG#v}"
+          notes="$(mktemp)"
+          awk -v ver="${version}" '
+            $0 ~ "^## v" ver " " { found=1; next }
+            found && /^## v/ { exit }
+            found { print }
+          ' CHANGELOG.md > "${notes}"
+          gh release create "${TAG}" \
+            --title "${TAG}" \
+            --notes-file "${notes}" \
+            --verify-tag
 
   publish:
     name: Publish image to GHCR
