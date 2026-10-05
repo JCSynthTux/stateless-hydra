@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v0.2.0 (2026-10-05)
+
+### Documentation
+
+- Document NZB download resolution and forceGetnzbRebuild with examples
+  ([`43bf939`](https://github.com/JCSynthTux/stateless-hydra/commit/43bf939a029fc23d3513d560715f9da5f657501f))
+
+### Features
+
+- **config**: Add per-indexer forceGetnzbRebuild flag for details-page URL guids
+  ([`0a5243c`](https://github.com/JCSynthTux/stateless-hydra/commit/0a5243c73df6f72cf15c64869445197410694677))
+
+
 ## v0.1.3 (2026-10-05)
 
 ### Bug Fixes
