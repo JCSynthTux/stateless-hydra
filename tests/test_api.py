@@ -413,6 +413,43 @@ def test_music_track_is_a_valid_search_param_and_is_forwarded(client, sample_rss
 
 
 @respx.mock
+def test_search_strips_tt_prefix_from_imdbid(client, sample_rss):
+    """nZEDb-style indexers (miatrix) match IMDb ids numerically.
+
+    Radarr/AIOStreams send the canonical ``tt``-prefixed form; forwarding it
+    verbatim made miatrix answer with an empty feed. nzbhydra2 strips the
+    prefix, so the id must reach the indexer as ``0903747``.
+    """
+    geek = respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+    respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
+
+    response = client.get(API, params={"t": "tvsearch", "imdbid": "tt0903747", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert _items(response.text)
+    assert geek.calls[0].request.url.params.get("imdbid") == "0903747"
+
+
+@pytest.mark.parametrize(
+    ("sent", "expected"),
+    [
+        ("tt0903747", "0903747"),
+        ("TT0903747", "0903747"),
+        ("0903747", "0903747"),
+        ("  tt0903747  ", "0903747"),
+    ],
+)
+@respx.mock
+def test_search_normalizes_imdbid_forms(client, sample_rss, sent, expected):
+    geek = respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+    respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
+
+    client.get(API, params={"t": "tvsearch", "imdbid": sent, "apikey": KEY})
+
+    assert geek.calls[0].request.url.params.get("imdbid") == expected
+
+
+@respx.mock
 def test_upstream_limit_is_capped_by_max_results_per_indexer(client, sample_rss):
     geek = respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
     respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))

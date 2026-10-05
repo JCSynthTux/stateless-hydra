@@ -154,6 +154,23 @@ def _parse_non_negative(value: str, name: str) -> int:
     return parsed
 
 
+def _normalize_imdb_id(value: str) -> str:
+    """Return the numeric IMDb id, dropping a leading ``tt``.
+
+    Newznab's movie-search spec documents ``imdbid`` in its numeric form
+    (``imdbid=0058935``), but clients such as Radarr/Sonarr and AIOStreams send
+    the canonical ``tt0058935`` form. nZEDb-based indexers (miatrix among them)
+    compare the value verbatim against their numeric column, so a ``tt``-prefixed
+    id matches nothing and they answer with an empty feed. nzbhydra2 strips the
+    prefix before forwarding (``Newznab.extendQueryUrlWithSearchIds``); do the
+    same here so ID-based movie searches return their results.
+    """
+    stripped = value.strip()
+    if stripped[:2].lower() == "tt":
+        return stripped[2:]
+    return stripped
+
+
 def _pub_date_key(pair: tuple[str, ResultItem]) -> datetime:
     """Sort key: parsed RFC 2822 pubDate, or the epoch when unparseable."""
     try:
@@ -367,6 +384,10 @@ async def _handle_search(request: Request, function: str, o: str) -> Response:
             continue
         if key not in forwarded:
             forwarded[key] = value
+
+    # Indexers expect the numeric IMDb id; clients send the tt-prefixed form.
+    if "imdbid" in forwarded:
+        forwarded["imdbid"] = _normalize_imdb_id(forwarded["imdbid"])
 
     filter_name = query.get("indexer")
 
