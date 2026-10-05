@@ -238,7 +238,7 @@ def test_search_items_carry_nzb_enclosure_pointing_at_our_getnzb(client, sample_
     first = enclosures[0]
     params = dict(httpx.URL(first.get("url")).params)
     assert first.get("url").startswith(f"http://testserver{API}?")
-    assert params["t"] == "getnzb"
+    assert params["t"] == "get"
     assert params["id"].startswith("slug:")
     assert params["apikey"] == KEY
     assert first.get("length") == "123456"
@@ -278,7 +278,7 @@ def test_search_items_survive_aiostreams_newznab_rules_and_enclosure_grabs(clien
         url = httpx.URL(enclosure.get("url"))
         params = dict(url.params)
         assert url.path == API
-        assert params["t"] == "getnzb"
+        assert params["t"] == "get"
         # The enclosure advertises the composed guid (indexer:token), which is
         # also the item's guid and never the upstream guid.
         assert params["id"] == item.findtext("guid")
@@ -315,6 +315,43 @@ def test_enclosure_url_round_trips_through_getnzb(client, sample_rss):
     assert download.status_code == 200
     assert download.content == b"real-nzb"
     assert download.headers["content-type"] == "application/x-nzb"
+
+
+@respx.mock
+def test_enclosure_url_has_aiostreams_hashable_shape(client, sample_rss):
+    # AIOStreams identifies an NZB by hashing its URL. Its ``hashNzbUrl``
+    # recognises ``/api?t=get&id=...`` and keeps ``t``+``id``; with the old
+    # ``t=getnzb`` it did not match and fell back to stripping the whole query,
+    # so every item hashed to the same ``/api`` value, collapsing all results
+    # into one release (wrong file selection and deduplication). Guard the
+    # shape and per-item identity.
+    def _geek(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("t") == "getnzb":
+            return httpx.Response(200, content=b"real-nzb")
+        return httpx.Response(200, text=sample_rss)
+
+    respx.get(GEEK).mock(side_effect=_geek)
+
+    search = client.get(
+        API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek"}
+    )
+
+    ids = []
+    for enclosure in _enclosures(search.text):
+        assert enclosure is not None
+        url = httpx.URL(enclosure.get("url"))
+        params = dict(url.params)
+        assert url.path == API
+        assert params["t"] == "get"
+        ids.append(params["id"])
+    assert len(ids) >= 2
+    # Distinct ids keep distinct canonical hashes; a shared one would collide.
+    assert len(set(ids)) == len(ids)
+
+    # The advertised ``t=get`` download function is served, not just advertised.
+    download = _follow_enclosure(client, search.text)
+    assert download.status_code == 200
+    assert download.content == b"real-nzb"
 
 
 @respx.mock

@@ -3,7 +3,8 @@
 The public surface mirrors nzbhydra2's external API:
 
 * ``GET /api`` dispatches on the ``t`` query parameter (``caps``, ``search``,
-  ``tvsearch``, ``movie``, ``music``, ``book``, ``details``, ``getnzb``);
+  ``tvsearch``, ``movie``, ``music``, ``book``, ``details``, ``getnzb``, and the
+  standard newznab ``get`` alias for downloads);
 * ``GET /healthz`` is a dependency-free liveness probe;
 * ``GET /readyz`` reports Redis connectivity for the readiness probe;
 * ``GET /metrics`` exposes Prometheus metrics without authentication.
@@ -55,7 +56,9 @@ JSON_MEDIA_TYPE = "application/json"
 
 _CAPS_SEARCH_TYPES = ["search", "tvsearch", "movie", "music", "book"]
 _SEARCH_FUNCTIONS = frozenset({"search", "tvsearch", "movie", "music", "book"})
-_KNOWN_FUNCTIONS = _SEARCH_FUNCTIONS | {"caps", "details", "getnzb"}
+# ``get`` is the standard newznab download function; ``getnzb`` is nzbhydra2's
+# own spelling. Both route to the same handler.
+_KNOWN_FUNCTIONS = _SEARCH_FUNCTIONS | {"caps", "details", "getnzb", "get"}
 
 # Query parameters interpreted by the proxy itself and never forwarded upstream.
 _CONTROL_PARAMS = frozenset({"t", "apikey", "o", "offset", "limit", "indexer"})
@@ -207,10 +210,19 @@ def _download_url(request: Request, composed_guid: str) -> str:
     query string because clients fetch the enclosure URL verbatim and would not
     otherwise authenticate. It is the caller's own credential, never an indexer
     key.
+
+    The function is advertised as the standard newznab ``t=get`` (with the
+    release identity in ``id``) rather than ``t=getnzb``. AIOStreams identifies
+    an NZB by hashing its URL: its ``hashNzbUrl`` knows the ``/api?t=get&id=...``
+    shape and keeps ``t`` and ``id``, but does not know ``t=getnzb``, so it falls
+    back to stripping the whole query. Every item then hashed to the same
+    ``/api`` value, collapsing all results into one release (wrong file
+    selection and deduplication). ``get`` keeps each item's identity in the
+    canonical hash; ``getnzb`` remains accepted server-side for older clients.
     """
     base = str(request.base_url).rstrip("/")
     apikey = request.query_params.get("apikey", "")
-    query = urlencode({"t": "getnzb", "id": composed_guid, "apikey": apikey})
+    query = urlencode({"t": "get", "id": composed_guid, "apikey": apikey})
     return f"{base}{request.url.path}?{query}"
 
 
