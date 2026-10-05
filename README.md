@@ -273,10 +273,21 @@ caching. The cache shortens indexer API usage, which is why it is a core part
 of the limits story. Clearing Redis is always safe: it only costs a cold cache
 and a reset of the current day's counters.
 
-## Metrics
+## Monitoring
+
+### Metrics
 
 Prometheus metrics are exposed at `/metrics` under the `stateless_hydra_`
-prefix.
+prefix. The endpoint is **unauthenticated** and served on the app port
+(**5076**), so a plain Prometheus scrape only needs the Service/pod address:
+
+```yaml
+scrape_configs:
+  - job_name: stateless-hydra
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["stateless-hydra.stateless-hydra.svc.cluster.local:5076"]
+```
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
@@ -288,7 +299,46 @@ prefix.
 | `stateless_hydra_indexer_limit_reached_total` | counter | `indexer`, `kind` | Times a budget was hit (`kind` = `api` or `nzb`). |
 | `stateless_hydra_cache_hits_total` | counter | `indexer` | Cache hits per indexer. |
 | `stateless_hydra_cache_misses_total` | counter | `indexer` | Cache misses per indexer. |
-| `stateless_hydra_limit_remaining` | gauge | `indexer`, `kind` | Remaining budget for the current window. |
+| `stateless_hydra_limit_remaining` | gauge | `indexer`, `kind` | Remaining budget for the current window (`0` = unlimited; only present while limits are tracked). |
+
+### Prometheus Operator (ServiceMonitor)
+
+If you run the [Prometheus
+Operator](https://github.com/prometheus-operator/prometheus-operator),
+`k8s/servicemonitor.yaml` configures a 30s scrape of `/metrics`:
+
+```sh
+kubectl apply -f k8s/servicemonitor.yaml
+# or as part of the Kustomize bundle:
+kubectl apply -k k8s/
+```
+
+The ServiceMonitor selects the `stateless-hydra` Service by its
+`app: stateless-hydra` label and scrapes the named `http` port (5076). It
+requires the operator's `monitoring.coreos.com/v1` CRDs, and the Prometheus
+instance that should scrape it must be allowed to discover this namespace — a
+`serviceMonitorNamespaceSelector`/`namespaceSelector` that includes
+`stateless-hydra` and a `serviceMonitorSelector` matching the manifest's
+labels. If your Prometheus only selects labelled ServiceMonitors, add its
+release label under `metadata.labels`. Clusters without the operator can simply
+drop `servicemonitor.yaml` from `k8s/kustomization.yaml`.
+
+### Grafana
+
+An importable dashboard ships at `grafana/stateless-hydra-dashboard.json`
+(schemaVersion 39, works with Grafana 9/10/11):
+
+1. In Grafana, go to **Dashboards → New → Import**.
+2. **Upload** `grafana/stateless-hydra-dashboard.json` (or paste its contents).
+3. When prompted, pick your **Prometheus** data source for the `DS_PROMETHEUS`
+   input and click **Import**.
+
+The dashboard has three rows — **Overview** (search rate, cache hit ratio, 24h
+API-hit/NZB-pull/error totals, searches by function and p50/p95 latency),
+**Indexers** (per-indexer API hits, NZB pulls, errors, limit-reached and cache
+hit/miss rates, plus tables of remaining API/NZB limits) and **Requests**
+(request-duration overview and range-normalized searches per function). It
+refreshes every 30s and defaults to a `now-6h` range.
 
 ## API usage examples
 
