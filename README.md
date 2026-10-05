@@ -54,8 +54,9 @@ runtime state lives in Redis.
 ```
 
 - Clients authenticate against **hydra API keys** (`hydraApiKeys`).
-- stateless-hydra fans a search out to the **enabled indexers** that support
-  the requested function, using each indexer's own API key (`apiKeys`).
+- stateless-hydra fans a search out **concurrently** to the **enabled indexers**
+  that support the requested function, using each indexer's own API key
+  (`apiKeys`); total latency tracks the slowest indexer rather than their sum.
 - Results are merged, optionally de-duplicated and cached in Redis.
 - `getnzb` downloads are routed back to the owning indexer via the composed
   guid (`<indexer>:<original-guid>`).

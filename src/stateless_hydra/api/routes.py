@@ -15,10 +15,13 @@ Everything in this module operates on ``request.app.state`` (populated by
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import secrets
 import time
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -250,6 +253,95 @@ async def _update_limit_gauge(request: Request, indexer: str, kind: LimitKind) -
         request.app.state.metrics.set_limit_remaining(indexer, kind.value, status.remaining)
 
 
+@dataclass
+class IndexerSearchResult:
+    """Outcome of querying a single indexer for one search.
+
+    A per-indexer coroutine returns one of these instead of mutating shared
+    accumulators, so the queries can run concurrently without touching shared
+    state; the caller merges them in configuration order afterwards.
+    """
+
+    items: list[ResultItem] = field(default_factory=list)
+    obtained: bool = False
+    limit_skipped: bool = False
+    error_skipped: bool = False
+
+
+async def _query_indexer(
+    request: Request,
+    indexer: IndexerConfig,
+    function: str,
+    forwarded: dict[str, str],
+    indexer_limit: int,
+) -> IndexerSearchResult:
+    """Query one indexer, honouring the cache, its API-hit budget and errors.
+
+    The result is self-contained (no shared state is written), so callers may
+    run this concurrently for every eligible indexer.
+    """
+    app = request.app
+    metrics = app.state.metrics
+    name = indexer.name
+    client = app.state.clients[name]
+
+    if client.supports(function):
+        effective = function
+    elif client.supports("search"):
+        effective = "search"
+    else:
+        return IndexerSearchResult()
+
+    params = {**forwarded, "t": effective, "limit": str(indexer_limit)}
+    key = cache_key_for(canonical_query(params))
+
+    cached = await app.state.cache.get(name, key)
+    if cached is not None:
+        metrics.inc_cache_hit(name)
+        parsed = _parse_or_none(name, cached, metrics)
+        if parsed is None:
+            return IndexerSearchResult(error_skipped=True)
+        return IndexerSearchResult(items=list(parsed.items), obtained=True)
+
+    metrics.inc_cache_miss(name)
+    allowed = await app.state.limits.consume(name, LimitKind.API)
+    await _update_limit_gauge(request, name, LimitKind.API)
+    if not allowed:
+        metrics.inc_limit_reached(name, LimitKind.API.value)
+        return IndexerSearchResult(limit_skipped=True)
+
+    metrics.inc_api_hit(name)
+    try:
+        text = await client.search(params)
+    except IndexerError:
+        logger.warning("indexer %s search failed", name, exc_info=True)
+        metrics.inc_error(name)
+        return IndexerSearchResult(error_skipped=True)
+
+    # Parse before caching: a malformed response must not be cached and
+    # re-served as a permanent error on every subsequent search.
+    parsed = _parse_or_none(name, text, metrics)
+    if parsed is None:
+        return IndexerSearchResult(error_skipped=True)
+    await app.state.cache.set(name, key, text, indexer.cache_ttl_seconds)
+    return IndexerSearchResult(items=list(parsed.items), obtained=True)
+
+
+async def _run_indexer_searches(
+    indexers: Sequence[IndexerConfig],
+    query_fn: Callable[[IndexerConfig], Awaitable[IndexerSearchResult]],
+) -> list[IndexerSearchResult]:
+    """Run every indexer query concurrently, preserving input order.
+
+    ``asyncio.gather`` returns results in the order its awaitables were passed,
+    regardless of completion order, so merging them in configuration order
+    keeps the aggregated response deterministic. Each ``query_fn`` call must be
+    self-contained: per-indexer work returns its own result rather than
+    appending to a shared accumulator.
+    """
+    return list(await asyncio.gather(*(query_fn(indexer) for indexer in indexers)))
+
+
 async def _query_indexers(
     request: Request,
     function: str,
@@ -257,74 +349,38 @@ async def _query_indexers(
     limit: int,
     filter_name: str | None,
 ) -> tuple[list[tuple[str, ResultItem]], bool, int, int]:
-    """Fan out a search across eligible indexers and collect their items.
+    """Fan out a search across eligible indexers concurrently and collect items.
 
-    Returns ``(merged, results_obtained, limit_skips, error_skips)``.
+    Returns ``(merged, results_obtained, limit_skips, error_skips)``. All
+    eligible indexers are queried in parallel; results are merged in
+    configuration order so the final response is byte-for-byte deterministic.
     """
     app = request.app
     settings = app.state.settings
-    metrics = app.state.metrics
 
     indexer_limit = min(limit or 100, settings.max_results_per_indexer)
+    eligible = [
+        indexer
+        for name, indexer in app.state.indexers.items()
+        if indexer.enabled and (filter_name is None or name == filter_name)
+    ]
+
+    outcomes = await _run_indexer_searches(
+        eligible,
+        lambda indexer: _query_indexer(request, indexer, function, forwarded, indexer_limit),
+    )
+
     merged: list[tuple[str, ResultItem]] = []
     results_obtained = False
     limit_skips = 0
     error_skips = 0
-
-    for name, indexer in app.state.indexers.items():
-        if not indexer.enabled:
-            continue
-        if filter_name is not None and name != filter_name:
-            continue
-
-        client = app.state.clients[name]
-        if client.supports(function):
-            effective = function
-        elif client.supports("search"):
-            effective = "search"
-        else:
-            continue
-
-        params = {**forwarded, "t": effective, "limit": str(indexer_limit)}
-        key = cache_key_for(canonical_query(params))
-
-        cached = await app.state.cache.get(name, key)
-        if cached is not None:
-            metrics.inc_cache_hit(name)
-            parsed = _parse_or_none(name, cached, metrics)
-            if parsed is None:
-                error_skips += 1
-                continue
-            results_obtained = True
-            merged.extend((name, item) for item in parsed.items)
-            continue
-
-        metrics.inc_cache_miss(name)
-        allowed = await app.state.limits.consume(name, LimitKind.API)
-        await _update_limit_gauge(request, name, LimitKind.API)
-        if not allowed:
-            metrics.inc_limit_reached(name, LimitKind.API.value)
-            limit_skips += 1
-            continue
-
-        metrics.inc_api_hit(name)
-        try:
-            text = await client.search(params)
-        except IndexerError:
-            logger.warning("indexer %s search failed", name, exc_info=True)
-            metrics.inc_error(name)
-            error_skips += 1
-            continue
-
-        # Parse before caching: a malformed response must not be cached and
-        # re-served as a permanent error on every subsequent search.
-        parsed = _parse_or_none(name, text, metrics)
-        if parsed is None:
-            error_skips += 1
-            continue
-        await app.state.cache.set(name, key, text, indexer.cache_ttl_seconds)
-        results_obtained = True
-        merged.extend((name, item) for item in parsed.items)
+    # Merge in configuration order (gather preserves it) before the downstream
+    # pubDate sort, matching the previous sequential fan-out exactly.
+    for indexer, outcome in zip(eligible, outcomes, strict=True):
+        merged.extend((indexer.name, item) for item in outcome.items)
+        results_obtained = results_obtained or outcome.obtained
+        limit_skips += outcome.limit_skipped
+        error_skips += outcome.error_skipped
 
     return merged, results_obtained, limit_skips, error_skips
 
