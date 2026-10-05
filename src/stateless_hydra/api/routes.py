@@ -313,7 +313,26 @@ async def _query_indexers(
 
 
 def _parse_or_none(name: str, text: str, metrics: Metrics) -> ParsedRss | None:
-    """Parse an indexer feed, counting and swallowing malformed responses."""
+    """Parse an indexer feed, counting and swallowing malformed responses.
+
+    Indexers frequently answer a *search* with HTTP 200 and a Newznab
+    ``<error code=... description=.../>`` body (nZEDb returns HTTP 200 for every
+    failure). Such a body has no ``<channel>`` and would otherwise parse as a
+    perfectly valid empty feed -- a silent zero-result that is indistinguishable
+    from "no matches". Detect it here so the indexer is skipped, an error is
+    logged and counted, and the empty-result logic (900/910) sees the failure.
+    """
+    upstream_error = parse_upstream_error(text)
+    if upstream_error is not None:
+        code, description = upstream_error
+        logger.warning(
+            "indexer %s returned upstream error %s: %s",
+            name,
+            code,
+            description or "no description",
+        )
+        metrics.inc_error(name)
+        return None
     try:
         return parse_indexer_rss(text)
     except ValueError:

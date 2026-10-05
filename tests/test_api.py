@@ -497,6 +497,71 @@ def test_malformed_upstream_response_is_not_cached(client, sample_rss):
     assert geek.call_count == 2
 
 
+_UPSTREAM_ERROR_XML = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<error code="203" description="Function not available"/>'
+)
+
+_EMPTY_RSS = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<rss version="2.0" xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/">'
+    '<channel><title>Empty</title><newznab:response offset="0" total="0"/></channel></rss>'
+)
+
+
+@respx.mock
+def test_search_upstream_error_xml_is_not_a_silent_empty_result(client, sample_rss):
+    """HTTP 200 + ``<error/>`` must be an indexer error, not a valid empty feed.
+
+    nZEDb answers every failure with HTTP 200, so an error body has no channel
+    and used to parse as an empty (but successful) feed -- a silent zero result.
+    It must be skipped, logged/counted, and left uncached.
+    """
+    geek = respx.get(GEEK).mock(return_value=httpx.Response(200, text=_UPSTREAM_ERROR_XML))
+    respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
+
+    params = {"t": "search", "q": "ubuntu", "apikey": KEY}
+    first = client.get(API, params=params)
+    second = client.get(API, params=params)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    # The healthy indexer's results still flow; the error is not a valid feed.
+    assert _guid_prefixes(first.text) == ["slug", "slug"]
+    # The error body must not be cached, so the second search re-queries it.
+    assert geek.call_count == 2
+    metrics = client.get("/metrics").text
+    assert 'stateless_hydra_indexer_errors_total{indexer="nzbgeek"} 2.0' in metrics
+
+
+@respx.mock
+def test_all_indexers_upstream_error_xml_yields_900(client):
+    respx.get(GEEK).mock(return_value=httpx.Response(200, text=_UPSTREAM_ERROR_XML))
+    respx.get(SLUG).mock(return_value=httpx.Response(200, text=_UPSTREAM_ERROR_XML))
+
+    response = client.get(API, params={"t": "search", "q": "ubuntu", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert 'code="900"' in response.text
+    metrics = client.get("/metrics").text
+    assert 'stateless_hydra_indexer_errors_total{indexer="nzbgeek"} 1.0' in metrics
+    assert 'stateless_hydra_indexer_errors_total{indexer="slug"} 1.0' in metrics
+
+
+@respx.mock
+def test_legit_empty_feed_is_not_an_indexer_error(client, sample_rss):
+    """A real ``total="0"`` feed means "no matches", not an upstream failure."""
+    respx.get(GEEK).mock(return_value=httpx.Response(200, text=_EMPTY_RSS))
+    respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
+
+    response = client.get(API, params={"t": "search", "q": "ubuntu", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert _guid_prefixes(response.text) == ["slug", "slug"]
+    metrics = client.get("/metrics").text
+    assert 'stateless_hydra_indexer_errors_total{indexer="nzbgeek"} 1.0' not in metrics
+
+
 # --- API hit limits ----------------------------------------------------------
 
 
