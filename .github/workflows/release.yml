@@ -50,7 +50,7 @@ jobs:
           # determine the next version from conventional commits.
           fetch-depth: 0
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install python-semantic-release
