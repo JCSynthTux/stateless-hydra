@@ -1,6 +1,41 @@
 # CHANGELOG
 
 
+## v0.3.0 (2026-10-05)
+
+### Chores
+
+- Sync uv.lock with pyproject version 0.2.0
+  ([`aa59199`](https://github.com/JCSynthTux/stateless-hydra/commit/aa5919934404679500451d255b208846f476d071))
+
+semantic-release bumps project.version in pyproject.toml but does not relock, so uv.lock recorded
+  the editable stateless-hydra package at the old 0.1.0. That mismatch made `uv run` rewrite uv.lock
+  on every local invocation (dirty tree) and made `uv lock --check` fail.
+
+Regenerate the lock so it matches pyproject at commit time. The resolved dependency graph is
+  unchanged; only the root package version moves.
+
+Note: CI is not broken by this drift. Both lint and test jobs use `uv sync --frozen`, which uses the
+  lock as written and tolerates a root-package version mismatch (verified locally on uv 0.12.23 and
+  in the GitHub Actions log for 43bf939, where it installed stateless-hydra==0.1.3 from a lock
+  recording 0.1.0). `--frozen` stays intentional; it only fails when the dependency set itself
+  changes without a relock. Expect this one-line drift to reappear after each future release until
+  relocking is automated in the release pipeline.
+
+### Documentation
+
+- Document token-based download resolution and indexer guidance
+  ([`2571149`](https://github.com/JCSynthTux/stateless-hydra/commit/25711499b4b64275c3e91ba16ffe2ff0a6967513))
+
+### Features
+
+- **api**: Resolve NZB downloads via short-lived Redis tokens without leaking upstream URLs
+  ([`f98ab30`](https://github.com/JCSynthTux/stateless-hydra/commit/f98ab303020e60762316a9f4f1a110116fedfe81))
+
+- **config**: Add per-indexer downloadFunction option (get/getnzb) for NZB rebuilds
+  ([`95fef13`](https://github.com/JCSynthTux/stateless-hydra/commit/95fef132f0013a4c3d3404c1947557729448062b))
+
+
 ## v0.2.0 (2026-10-05)
 
 ### Documentation
