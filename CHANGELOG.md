@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## v0.4.1 (2026-10-05)
+
+### Bug Fixes
+
+- **ci**: Publish release images with explicit semver tags and latest
+  ([`997afb8`](https://github.com/JCSynthTux/stateless-hydra/commit/997afb859ce611bcb6c381e0cfda5f004dcfe2d7))
+
+
 ## v0.4.0 (2026-10-05)
 
 ### Documentation
