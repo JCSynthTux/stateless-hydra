@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## v0.3.2 (2026-10-05)
+
+### Bug Fixes
+
+- Derive package version from installed metadata so caps reports the real version
+  ([`53af9a1`](https://github.com/JCSynthTux/stateless-hydra/commit/53af9a151d28e9e57a517f746f5c5a9aa60e0cfe))
+
+
 ## v0.3.1 (2026-10-05)
 
 ### Bug Fixes
