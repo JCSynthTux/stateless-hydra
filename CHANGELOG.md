@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## v0.4.3 (2026-10-05)
+
+### Bug Fixes
+
+- **ci**: Create GitHub release from changelog after deferred tag push
+  ([`9f5f38d`](https://github.com/JCSynthTux/stateless-hydra/commit/9f5f38da88863d2ab56a35ff987d5ea6d334067f))
+
+
 ## v0.4.2 (2026-10-05)
 
 ### Bug Fixes
