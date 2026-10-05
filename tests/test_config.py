@@ -32,6 +32,7 @@ indexers:
     categories: [2000, 5000]
     proxyUrl: http://proxy.corp:3128
     forceGetnzbRebuild: true
+    downloadFunction: get
 """
 
 MINIMAL_INDEXERS_YAML = """
@@ -124,6 +125,7 @@ def test_full_indexers_yaml_loads_all_fields(tmp_path):
     assert indexer.categories == [2000, 5000]
     assert indexer.proxy_url == "http://proxy.corp:3128"
     assert indexer.force_getnzb_rebuild is True
+    assert indexer.download_function == "get"
 
 
 def test_force_getnzb_rebuild_defaults_false(tmp_path):
@@ -143,6 +145,36 @@ def test_force_getnzb_rebuild_alias_parses(tmp_path):
     indexer = load_indexers(path)[0]
 
     assert indexer.force_getnzb_rebuild is True
+
+
+def test_download_function_defaults_to_getnzb(tmp_path):
+    path = _write(tmp_path, "indexers.yaml", MINIMAL_INDEXERS_YAML)
+    indexer = load_indexers(path)[0]
+
+    assert indexer.download_function == "getnzb"
+
+
+def test_download_function_alias_parses_get(tmp_path):
+    path = _write(
+        tmp_path,
+        "indexers.yaml",
+        "indexers:\n  - name: getter\n    host: https://api.example.invalid\n"
+        "    apiKeyRef: getter\n    downloadFunction: get\n",
+    )
+    indexer = load_indexers(path)[0]
+
+    assert indexer.download_function == "get"
+
+
+def test_invalid_download_function_raises_config_error(tmp_path):
+    path = _write(
+        tmp_path,
+        "indexers.yaml",
+        "indexers:\n  - name: bad\n    host: https://api.example.invalid\n"
+        "    apiKeyRef: bad\n    downloadFunction: download\n",
+    )
+    with pytest.raises(ConfigError):
+        load_indexers(path)
 
 
 def test_indexer_defaults_applied(tmp_path):

@@ -18,6 +18,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
@@ -53,9 +54,13 @@ class IndexerConfig(BaseModel):
     timeout_seconds: float = Field(default=30.0, alias="timeoutSeconds", gt=0)
     # None -> global default; <=0 -> disabled
     cache_ttl_seconds: int | None = Field(default=None, alias="cacheTtlSeconds")
-    # True -> always rebuild t=getnzb&id=<guid>, even for URL-shaped guids.
-    # False -> fetch URL-shaped guids directly (altHUB-style .nzb URLs).
+    # True -> always rebuild t=<downloadFunction>&id=<guid>, even for URL-shaped
+    # guids. False -> fetch URL-shaped guids directly (altHUB-style .nzb URLs).
     force_getnzb_rebuild: bool = Field(default=False, alias="forceGetnzbRebuild")
+    # Upstream Newznab function used by the rebuild path. "getnzb" is the
+    # standard function; classic nZEDb/Newznab indexers (drunkenSlug, altHUB)
+    # only implement "get".
+    download_function: Literal["getnzb", "get"] = Field(default="getnzb", alias="downloadFunction")
     search_types: list[str] = Field(default_factory=lambda: ["search"], alias="searchTypes")
     categories: list[int] | None = Field(default=None, alias="categories")  # None -> all
     proxy_url: str | None = Field(default=None, alias="proxyUrl")  # per-indexer override
