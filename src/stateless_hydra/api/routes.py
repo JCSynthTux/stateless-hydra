@@ -14,7 +14,9 @@ Everything in this module operates on ``request.app.state`` (populated by
 
 from __future__ import annotations
 
+import json
 import logging
+import secrets
 import time
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -26,7 +28,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from ..cache import cache_key_for
-from ..indexer_client import IndexerError
+from ..config import IndexerConfig
+from ..indexer_client import IndexerClient, IndexerError
 from ..limits import LimitKind
 from ..metrics import Metrics
 from ..newznab import (
@@ -77,6 +80,57 @@ _SEARCH_PARAMS = (
 )
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+# Client-facing NZB downloads are addressed by an opaque token, never by the
+# upstream URL: that URL may embed an indexer API key (e.g. drunkenSlug's
+# ``r=`` parameter). Tokens live in Redis for two weeks so an advertised NZB
+# stays grabbable well after the search that produced it; Redis is the shared
+# store across replicas, so any pod can resolve any token.
+_NZB_TOKEN_TTL = 14 * 24 * 3600
+_NZB_TOKEN_PREFIX = "stateless_hydra:nzb"
+
+
+def _nzb_token_key(token: str) -> str:
+    """Redis key holding the upstream URL for a client-facing download token."""
+    return f"{_NZB_TOKEN_PREFIX}:{token}"
+
+
+def _derive_download_url(owner: IndexerConfig, client: IndexerClient, original_guid: str) -> str:
+    """Derive the upstream download URL for an item at search time.
+
+    A URL-shaped guid is the download itself (altHUB-style .nzb URLs, and
+    nZEDb indexers whose permalink ``<link>`` is the .nzb URL) and is fetched
+    directly, unless the indexer opts into a rebuild. Everything else is
+    rebuilt through the indexer's configured ``downloadFunction``.
+    """
+    if not owner.force_getnzb_rebuild and original_guid.startswith(("http://", "https://")):
+        return original_guid
+    return client.build_url({"t": owner.download_function, "id": original_guid})
+
+
+def _decode_nzb_token(raw: str | bytes | None) -> dict[str, Any] | None:
+    """Decode a stored token payload, returning ``None`` when absent/corrupt."""
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _nzb_filename(token: str) -> str:
+    """A header-safe filename stem for a download token.
+
+    Normal tokens are urlsafe and pass through unchanged. Legacy URL-shaped
+    guids are client-supplied, so only their final path segment is used and
+    unsafe characters are replaced, preventing Content-Disposition injection.
+    """
+    candidate = token.rstrip("/").rsplit("/", 1)[-1]
+    safe = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in candidate)
+    return safe or "download"
 
 
 def _render(payload: str | dict[str, Any], o: str) -> Response:
@@ -309,7 +363,19 @@ async def _handle_search(request: Request, function: str, o: str) -> Response:
     page = ordered[offset : offset + limit]
     items = []
     for name, item in page:
-        guid = compose_guid(name, item.guid)
+        owner = request.app.state.indexers[name]
+        client = request.app.state.clients[name]
+        upstream_url = _derive_download_url(owner, client, item.guid)
+        # The upstream URL may embed an indexer API key, so it is stored
+        # server-side and only an opaque token is rendered to the client. On a
+        # cache-hit re-render this runs again, refreshing the token's TTL.
+        token = secrets.token_urlsafe(16)
+        await request.app.state.redis.set(
+            _nzb_token_key(token),
+            json.dumps({"indexer": name, "url": upstream_url}),
+            ex=_NZB_TOKEN_TTL,
+        )
+        guid = compose_guid(name, token)
         download_url = _download_url(request, guid)
         # nzbhydra2 advertises its own download link as both the item link and
         # the enclosure URL; AIOStreams (newznab) requires the enclosure to
@@ -372,11 +438,23 @@ async def _handle_getnzb(request: Request) -> Response:
     split = split_guid(item_id)
     if split is None:
         raise NewznabError(300, "No such item")
-    indexer_name, original_guid = split
+    indexer_name, token = split
     if not _enabled_owner(request, indexer_name):
         raise NewznabError(300, "No such item")
-    owner = app.state.indexers[indexer_name]
     client = app.state.clients[indexer_name]
+
+    if token.startswith(("http://", "https://")):
+        # Backward compatibility: guids issued before download tokens existed
+        # are upstream URLs (possibly carrying an indexer key). Fetch directly.
+        upstream_url = token
+    else:
+        # Resolve the opaque token to the upstream URL stored at search time.
+        stored = _decode_nzb_token(await app.state.redis.get(_nzb_token_key(token)))
+        if stored is None or stored.get("indexer") != indexer_name:
+            raise NewznabError(300, "No such item (download token expired or unknown)")
+        upstream_url = stored.get("url")
+        if not isinstance(upstream_url, str) or not upstream_url:
+            raise NewznabError(300, "No such item (download token expired or unknown)")
 
     allowed = await app.state.limits.consume(indexer_name, LimitKind.NZB)
     await _update_limit_gauge(request, indexer_name, LimitKind.NZB)
@@ -386,16 +464,7 @@ async def _handle_getnzb(request: Request) -> Response:
     metrics.inc_nzb_pull(indexer_name)
 
     try:
-        if original_guid.startswith(("http://", "https://")) and not owner.force_getnzb_rebuild:
-            # URL-shaped guids (altHUB among others) are already complete
-            # download URLs; rebuilding them as t=getnzb would make the
-            # indexer answer "no such function". Fetch the URL directly,
-            # matching how the indexer advertises the download. Indexers whose
-            # URL-shaped guid points at a details page instead opt out with
-            # forceGetnzbRebuild: true, which forces the rebuild path below.
-            response = await client.fetch(original_guid)
-        else:
-            response = await client.fetch(client.build_url({"t": "getnzb", "id": original_guid}))
+        response = await client.fetch(upstream_url)
     except IndexerError:
         logger.warning("indexer %s getnzb failed", indexer_name, exc_info=True)
         metrics.inc_error(indexer_name)
@@ -413,7 +482,7 @@ async def _handle_getnzb(request: Request) -> Response:
     if response.status_code >= 400:
         raise NewznabError(300 if response.status_code == 404 else 900)
 
-    headers = {"Content-Disposition": f'attachment; filename="{original_guid}.nzb"'}
+    headers = {"Content-Disposition": f'attachment; filename="{_nzb_filename(token)}.nzb"'}
     return StreamingResponse(
         response.aiter_bytes(), media_type="application/x-nzb", headers=headers
     )

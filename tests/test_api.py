@@ -7,6 +7,9 @@ services are required.
 
 from __future__ import annotations
 
+import json
+import re
+
 import httpx
 import pytest
 import respx
@@ -58,6 +61,44 @@ def _response_total(response_text: str) -> str | None:
         if local == "response":
             return element.get("total")
     return None
+
+
+def _guid_prefixes(response_text: str) -> list[str]:
+    """The indexer name of each composed guid (the part before the token)."""
+    return [guid.split(":", 1)[0] for guid in _guids(response_text)]
+
+
+def _follow_enclosure(client, response_text: str, index: int = 0):
+    """Fetch this proxy's own getnzb URL advertised on item ``index``."""
+    url = httpx.URL(_enclosures(response_text)[index].get("url"))
+    return client.get(url.path, params=dict(url.params))
+
+
+def _esc(value: str) -> str:
+    """Minimal XML text escaping for inline test feeds."""
+    return (
+        value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    )
+
+
+def _single_item_rss(guid: str, link: str | None = None, *, permalink: bool = False) -> str:
+    """A one-item Newznab feed with a controllable guid/link pair."""
+    link = guid if link is None else link
+    perma = "true" if permalink else "false"
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<rss version="2.0" xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/">'
+        "<channel><title>Sample</title>"
+        '<newznab:response offset="0" total="1"/>'
+        "<item>"
+        "<title>Single Item</title>"
+        f'<guid isPermaLink="{perma}">{_esc(guid)}</guid>'
+        f"<link>{_esc(link)}</link>"
+        "<pubDate>Mon, 02 Oct 2023 12:00:00 GMT</pubDate>"
+        "<category>5040</category>"
+        "<size>123456</size>"
+        "</item></channel></rss>"
+    )
 
 
 # --- authentication and dispatch --------------------------------------------
@@ -125,12 +166,7 @@ def test_search_aggregates_both_indexers_and_sorts_by_pubdate(client, sample_rss
     assert len(_items(response.text)) == 4
     assert _response_total(response.text) == "4"
     # Newest first: slug (04 Oct), geek (02 Oct), geek (01 Oct), slug (30 Sep).
-    assert _guids(response.text) == [
-        "slug:sguid-one",
-        "nzbgeek:guid-one",
-        "nzbgeek:guid-two",
-        "slug:sguid-two",
-    ]
+    assert _guid_prefixes(response.text) == ["slug", "nzbgeek", "nzbgeek", "slug"]
 
 
 @respx.mock
@@ -178,9 +214,13 @@ def test_search_items_carry_nzb_enclosure_pointing_at_our_getnzb(client, sample_
     params = dict(httpx.URL(first.get("url")).params)
     assert first.get("url").startswith(f"http://testserver{API}?")
     assert params["t"] == "getnzb"
-    assert params["id"] == "slug:sguid-one"
+    assert params["id"].startswith("slug:")
     assert params["apikey"] == KEY
     assert first.get("length") == "123456"
+    # The client-facing URL must not leak the upstream URL or its query tokens.
+    assert "https://" not in params["id"]
+    assert "r=" not in params["id"]
+    assert "i=" not in params["id"]
 
 
 @respx.mock
@@ -221,7 +261,7 @@ def test_search_json_shape(client, sample_rss):
     assert data["results"]["channel"]["total"] == 4
     items = data["results"]["channel"]["items"]
     assert len(items) == 4
-    assert items[0]["guid"] == "slug:sguid-one"
+    assert items[0]["guid"].startswith("slug:")
 
 
 @respx.mock
@@ -288,7 +328,7 @@ def test_offset_slices_items_but_keeps_total(client, sample_rss):
 
     assert len(_items(response.text)) == 1
     assert _response_total(response.text) == "2"
-    assert _guids(response.text) == ["nzbgeek:guid-two"]
+    assert _guid_prefixes(response.text) == ["nzbgeek"]
 
 
 @respx.mock
@@ -387,19 +427,28 @@ def test_exhausted_indexer_filtered_alone_yields_910(client, sample_rss):
 
 
 @respx.mock
-def test_getnzb_succeeds_then_hits_930(client):
-    respx.get(GEEK, params={"t": "getnzb", "id": "xyz"}).mock(
+@respx.mock
+def test_getnzb_succeeds_then_hits_930(client, sample_rss):
+    respx.get(GEEK, params={"t": "search"}).mock(return_value=httpx.Response(200, text=sample_rss))
+    respx.get(GEEK, params={"t": "getnzb", "id": "guid-one"}).mock(
         return_value=httpx.Response(200, content=b"fake-nzb")
     )
 
-    first = client.get(API, params={"t": "getnzb", "id": "nzbgeek:xyz", "apikey": KEY})
+    search = client.get(
+        API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek"}
+    )
+    enclosure = _enclosures(search.text)[0]
+    url = httpx.URL(enclosure.get("url"))
+    request_params = dict(url.params)
+
+    first = client.get(url.path, params=request_params)
 
     assert first.status_code == 200
     assert first.content == b"fake-nzb"
     assert first.headers["content-type"] == "application/x-nzb"
-    assert 'filename="xyz.nzb"' in first.headers["content-disposition"]
+    assert first.headers["content-disposition"].endswith('.nzb"')
 
-    second = client.get(API, params={"t": "getnzb", "id": "nzbgeek:xyz", "apikey": KEY})
+    second = client.get(url.path, params=request_params)
 
     assert second.status_code == 200
     assert 'code="930"' in second.text
@@ -433,50 +482,86 @@ def test_getnzb_missing_id_yields_200(client):
 
 
 @respx.mock
-def test_getnzb_fetches_url_shaped_guid_directly(client):
+def test_getnzb_url_shaped_guid_is_direct_fetched_via_token(client):
     # altHUB (and similar indexers) advertise the download itself as the guid:
-    # a full URL with query parameters. Rebuilding that as t=getnzb&id=<url>
-    # makes the indexer answer "no such function", so the URL must be fetched
-    # verbatim instead.
+    # a full URL with query parameters. The upstream URL is derived at search
+    # time and stored under an opaque token, so the client never sees it.
     url_guid = "https://api.althub.co.za/getnzb/abc.nzb&i=1&r=2"
-    rss = (
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        '<rss version="2.0" xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/">'
-        "<channel><title>Sample</title>"
-        '<newznab:response offset="0" total="1"/>'
-        "<item>"
-        "<title>URL Guid Item</title>"
-        '<guid isPermaLink="false">https://api.althub.co.za/getnzb/abc.nzb&amp;i=1&amp;r=2</guid>'
-        "<link>https://api.althub.co.za/details/abc</link>"
-        "<pubDate>Mon, 02 Oct 2023 12:00:00 GMT</pubDate>"
-        "<category>5040</category>"
-        "<size>123456</size>"
-        "</item></channel></rss>"
-    )
-    # search serves the feed with the URL guid; any t=getnzb request would be
-    # the bug being fixed, so record it and never serve it.
+    rss = _single_item_rss(url_guid, link="https://api.althub.co.za/details/abc")
+    respx.get(GEEK, params={"t": "search"}).mock(return_value=httpx.Response(200, text=rss))
+    direct = respx.get(url_guid).mock(return_value=httpx.Response(200, content=b"direct-nzb"))
     newznab_route = respx.get(GEEK, params={"t": "getnzb"}).mock(
         return_value=httpx.Response(200, content=b"wrong-route")
     )
-    respx.get(GEEK, params={"t": "search"}).mock(return_value=httpx.Response(200, text=rss))
-    respx.get(SLUG).mock(return_value=httpx.Response(200, text="<rss><channel/></rss>"))
-    direct = respx.get(url_guid).mock(return_value=httpx.Response(200, content=b"direct-nzb"))
 
     search = client.get(
         API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek"}
     )
-    enclosure = _enclosures(search.text)[0]
-    guid = dict(httpx.URL(enclosure.get("url")).params)["id"]
-    assert guid == f"nzbgeek:{url_guid}"
+    composed = dict(httpx.URL(_enclosures(search.text)[0].get("url")).params)["id"]
+    assert composed.startswith("nzbgeek:")
+    assert "https://" not in composed
+    assert url_guid not in composed
 
-    url = httpx.URL(enclosure.get("url"))
-    response = client.get(url.path, params=dict(url.params))
+    response = _follow_enclosure(client, search.text)
 
     assert response.status_code == 200
     assert response.content == b"direct-nzb"
     assert response.headers["content-type"] == "application/x-nzb"
     assert direct.call_count == 1
     assert newznab_route.call_count == 0
+
+
+@respx.mock
+def test_getnzb_permalink_guid_is_replaced_by_direct_link(client):
+    # drunkenSlug-style: the RSS <guid isPermaLink="true"> is a details URL, but
+    # the <link> is the direct .nzb URL. The parser substitutes the link, so the
+    # default direct-fetch path downloads it without any rebuild. The link (which
+    # embeds the indexer key) is stored server-side and never rendered.
+    nzb_url = "https://nzbgeek.example.com/getnzb/abc.nzb&i=1&r=secretkey"
+    rss = _single_item_rss("https://nzbgeek.example.com/details/abc", link=nzb_url, permalink=True)
+    respx.get(GEEK, params={"t": "search"}).mock(return_value=httpx.Response(200, text=rss))
+    direct = respx.get(nzb_url).mock(return_value=httpx.Response(200, content=b"direct-nzb"))
+    getnzb_route = respx.get(GEEK, params={"t": "getnzb"}).mock(
+        return_value=httpx.Response(200, content=b"wrong-route")
+    )
+
+    search = client.get(
+        API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek"}
+    )
+    composed = dict(httpx.URL(_enclosures(search.text)[0].get("url")).params)["id"]
+    assert "https://" not in composed
+    assert "secretkey" not in composed
+
+    response = _follow_enclosure(client, search.text)
+
+    assert response.status_code == 200
+    assert response.content == b"direct-nzb"
+    assert response.headers["content-type"] == "application/x-nzb"
+    assert direct.call_count == 1
+    assert getnzb_route.call_count == 0
+
+
+@respx.mock
+def test_search_response_never_leaks_upstream_url_or_indexer_key(client):
+    # Regression: upstream URLs may embed indexer API keys (drunkenSlug's r=).
+    # Neither the URL nor any of its query tokens may appear in the client XML.
+    nzb_url = "https://api.althub.co.za/getnzb/abc.nzb&i=1&r=SECRETKEY"
+    rss = _single_item_rss(nzb_url, link="https://api.althub.co.za/details/abc")
+    respx.get(GEEK, params={"t": "search"}).mock(return_value=httpx.Response(200, text=rss))
+
+    response = client.get(
+        API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek"}
+    )
+
+    assert response.status_code == 200
+    assert "SECRETKEY" not in response.text
+    assert "api.althub.co.za" not in response.text
+    item_blocks = re.findall(r"<item>.*?</item>", response.text, re.DOTALL)
+    assert item_blocks
+    for block in item_blocks:
+        assert "https://" not in block
+        assert "r=" not in block
+        assert "i=" not in block
 
 
 @respx.mock
@@ -504,34 +589,108 @@ def test_getnzb_direct_url_upstream_error_xml_is_not_streamed(client):
     assert response.content != b"direct-nzb"
 
 
-@respx.mock
-def test_getnzb_legacy_non_url_guid_still_uses_newznab_route(client):
-    route = respx.get(GEEK, params={"t": "getnzb", "id": "xyz"}).mock(
-        return_value=httpx.Response(200, content=b"legacy-nzb")
+def test_getnzb_unknown_token_yields_300(client):
+    response = client.get(
+        API, params={"t": "getnzb", "id": "nzbgeek:not-a-real-token", "apikey": KEY}
     )
 
-    response = client.get(API, params={"t": "getnzb", "id": "nzbgeek:xyz", "apikey": KEY})
+    assert response.status_code == 200
+    assert 'code="300"' in response.text
+    assert "token expired or unknown" in response.text
+
+
+@respx.mock
+def test_getnzb_legacy_url_token_still_direct_fetches(client):
+    # A URL-shaped token is a pre-token guid; it must still be fetched directly.
+    url_guid = "https://api.althub.co.za/getnzb/legacy.nzb&i=9&r=8"
+    direct = respx.get(url_guid).mock(return_value=httpx.Response(200, content=b"legacy-nzb"))
+
+    response = client.get(API, params={"t": "getnzb", "id": f"nzbgeek:{url_guid}", "apikey": KEY})
 
     assert response.status_code == 200
     assert response.content == b"legacy-nzb"
     assert response.headers["content-type"] == "application/x-nzb"
-    assert route.call_count == 1
+    assert direct.call_count == 1
+    filename = response.headers["content-disposition"]
+    assert filename.startswith('attachment; filename="legacy.nzb')
+    assert "&" not in filename
 
 
 @respx.mock
-def test_getnzb_force_rebuild_uses_newznab_route_for_url_guid(client):
+def test_getnzb_token_indexer_mismatch_yields_300(client, sample_rss):
+    respx.get(GEEK, params={"t": "search"}).mock(return_value=httpx.Response(200, text=sample_rss))
+
+    search = client.get(
+        API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek"}
+    )
+    token = _guids(search.text)[0].split(":", 1)[1]
+
+    response = client.get(API, params={"t": "getnzb", "id": f"slug:{token}", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert 'code="300"' in response.text
+
+
+@respx.mock
+async def test_nzb_token_ttl_is_positive(settings, fake_redis, sample_rss):
+    app = create_app(settings, redis_client=fake_redis)
+    respx.get(GEEK, params={"t": "search"}).mock(return_value=httpx.Response(200, text=sample_rss))
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
+        response = await ac.get(
+            API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek"}
+        )
+
+    assert response.status_code == 200
+    token = _guids(response.text)[0].split(":", 1)[1]
+    ttl = await fake_redis.ttl(f"stateless_hydra:nzb:{token}")
+    assert ttl > 0
+
+
+@respx.mock
+async def test_nzb_token_stores_derived_upstream_url(settings, fake_redis, sample_rss):
+    # The token payload must hold the upstream URL derived at search time, not
+    # anything the client sent. Here nzbgeek's non-URL guid is rebuilt via the
+    # default downloadFunction.
+    app = create_app(settings, redis_client=fake_redis)
+    respx.get(GEEK, params={"t": "search"}).mock(return_value=httpx.Response(200, text=sample_rss))
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
+        response = await ac.get(
+            API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek"}
+        )
+
+    assert response.status_code == 200
+    token = _guids(response.text)[0].split(":", 1)[1]
+    raw = await fake_redis.get(f"stateless_hydra:nzb:{token}")
+    data = json.loads(raw)
+    assert data["indexer"] == "nzbgeek"
+    assert data["url"].startswith("https://nzbgeek.example.com/api?")
+    assert "t=getnzb" in data["url"]
+    assert "id=guid-one" in data["url"]
+
+
+@respx.mock
+def test_getnzb_force_rebuild_uses_download_function_for_url_guid(client):
     # detailsurl's guids are URLs pointing at a details page, so direct-fetching
-    # them returns HTML. forceGetnzbRebuild: true makes us rebuild
-    # t=getnzb&id=<url-guid> against the indexer instead of fetching the guid.
+    # them returns HTML. forceGetnzbRebuild: true derives a rebuild URL at search
+    # time, and downloadFunction: get selects the classic Newznab t=get function
+    # (nZEDb style).
     url_guid = "https://detailsurl.example.com/details/abc"
-    rebuilt = respx.get(DETAILSURL, params={"t": "getnzb", "id": url_guid}).mock(
+    respx.get(DETAILSURL, params={"t": "movie"}).mock(
+        return_value=httpx.Response(200, text=_single_item_rss(url_guid))
+    )
+    rebuilt = respx.get(DETAILSURL, params={"t": "get", "id": url_guid}).mock(
         return_value=httpx.Response(200, content=b"rebuilt-nzb")
     )
     direct = respx.get(url_guid).mock(return_value=httpx.Response(200, content=b"<html>"))
 
-    response = client.get(
-        API, params={"t": "getnzb", "id": f"detailsurl:{url_guid}", "apikey": KEY}
+    search = client.get(
+        API, params={"t": "movie", "imdbid": "0111161", "apikey": KEY, "indexer": "detailsurl"}
     )
+    response = _follow_enclosure(client, search.text)
 
     assert response.status_code == 200
     assert response.content == b"rebuilt-nzb"
@@ -541,11 +700,92 @@ def test_getnzb_force_rebuild_uses_newznab_route_for_url_guid(client):
 
 
 @respx.mock
+def test_getnzb_rebuild_honours_configured_download_function(client):
+    # The rebuild URL must use exactly the configured downloadFunction: t=get
+    # here, never the default t=getnzb, and never the details-page URL directly.
+    url_guid = "https://detailsurl.example.com/details/abc"
+    respx.get(DETAILSURL, params={"t": "movie"}).mock(
+        return_value=httpx.Response(200, text=_single_item_rss(url_guid))
+    )
+    get_route = respx.get(DETAILSURL, params={"t": "get", "id": url_guid}).mock(
+        return_value=httpx.Response(200, content=b"rebuilt-nzb")
+    )
+    getnzb_route = respx.get(DETAILSURL, params={"t": "getnzb"}).mock(
+        return_value=httpx.Response(200, content=b"wrong-route")
+    )
+    direct = respx.get(url_guid).mock(return_value=httpx.Response(200, content=b"<html>"))
+
+    search = client.get(
+        API, params={"t": "movie", "imdbid": "0111161", "apikey": KEY, "indexer": "detailsurl"}
+    )
+    response = _follow_enclosure(client, search.text)
+
+    assert response.status_code == 200
+    assert response.content == b"rebuilt-nzb"
+    assert response.headers["content-type"] == "application/x-nzb"
+    assert get_route.call_count == 1
+    assert getnzb_route.call_count == 0
+    assert direct.call_count == 0
+    upstream = get_route.calls[0].request
+    assert upstream.url.params.get("t") == "get"
+    assert upstream.url.params.get("id") == url_guid
+
+
+@respx.mock
+def test_getnzb_rebuild_defaults_to_getnzb(tmp_path, fake_redis):
+    # An indexer that forces the rebuild but leaves downloadFunction unset must
+    # keep using t=getnzb (the default), preserving pre-existing behaviour.
+    (tmp_path / "indexers.yaml").write_text(
+        "indexers:\n"
+        "  - name: defaultrebuild\n"
+        "    host: https://defaultrebuild.example.com\n"
+        "    apiPath: /api\n"
+        "    apiKeyRef: dr_key\n"
+        "    forceGetnzbRebuild: true\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "api-keys.yaml").write_text(
+        "apiKeys:\n  dr_key: dr-secret\nhydraApiKeys:\n  - test-key\n",
+        encoding="utf-8",
+    )
+    settings = AppSettings(
+        indexers_file=str(tmp_path / "indexers.yaml"),
+        api_keys_file=str(tmp_path / "api-keys.yaml"),
+        log_level="CRITICAL",
+    )
+    default_app = create_app(settings, redis_client=fake_redis)
+
+    url_guid = "https://defaultrebuild.example.com/details/abc"
+    base = "https://defaultrebuild.example.com/api"
+    respx.get(base, params={"t": "search"}).mock(
+        return_value=httpx.Response(200, text=_single_item_rss(url_guid))
+    )
+    route = respx.get(base, params={"t": "getnzb", "id": url_guid}).mock(
+        return_value=httpx.Response(200, content=b"default-nzb")
+    )
+    direct = respx.get(url_guid).mock(return_value=httpx.Response(200, content=b"<html>"))
+
+    with TestClient(default_app) as default_client:
+        search = default_client.get(
+            API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "defaultrebuild"}
+        )
+        response = _follow_enclosure(default_client, search.text)
+
+    assert response.status_code == 200
+    assert response.content == b"default-nzb"
+    assert route.call_count == 1
+    assert direct.call_count == 0
+
+
+@respx.mock
 def test_getnzb_force_rebuild_upstream_error_xml_is_translated(client):
     # The upstream-error detection must stay active on the rebuild path too: a
     # 200 Newznab error document is surfaced as our own error, not streamed.
     url_guid = "https://detailsurl.example.com/details/abc"
-    respx.get(DETAILSURL, params={"t": "getnzb", "id": url_guid}).mock(
+    respx.get(DETAILSURL, params={"t": "movie"}).mock(
+        return_value=httpx.Response(200, text=_single_item_rss(url_guid))
+    )
+    respx.get(DETAILSURL, params={"t": "get", "id": url_guid}).mock(
         return_value=httpx.Response(
             200,
             content=b'<?xml version="1.0"?>\n<error code="202" description="No such function"/>',
@@ -554,9 +794,10 @@ def test_getnzb_force_rebuild_upstream_error_xml_is_translated(client):
     )
     direct = respx.get(url_guid).mock(return_value=httpx.Response(200, content=b"<html>"))
 
-    response = client.get(
-        API, params={"t": "getnzb", "id": f"detailsurl:{url_guid}", "apikey": KEY}
+    search = client.get(
+        API, params={"t": "movie", "imdbid": "0111161", "apikey": KEY, "indexer": "detailsurl"}
     )
+    response = _follow_enclosure(client, search.text)
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/xml")
@@ -650,7 +891,7 @@ def test_failing_indexer_is_skipped(client, sample_rss):
     response = client.get(API, params={"t": "search", "q": "ubuntu", "apikey": KEY})
 
     assert response.status_code == 200
-    assert _guids(response.text) == ["nzbgeek:guid-one", "nzbgeek:guid-two"]
+    assert _guid_prefixes(response.text) == ["nzbgeek", "nzbgeek"]
     metrics = client.get("/metrics").text
     assert 'stateless_hydra_indexer_errors_total{indexer="slug"} 1.0' in metrics
 

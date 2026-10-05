@@ -39,9 +39,9 @@ indexers:
     apiKeyRef: ghost_key
     searchTypes: [search]
   # URL-shaped guids that point at a details page rather than an NZB: forces
-  # the t=getnzb rebuild path. searchTypes is [movie] so the existing
-  # search/music fan-out tests (which mock only nzbgeek and slug) never reach
-  # it; getnzb does not consult searchTypes.
+  # the t=get rebuild path (nZEDb-style downloadFunction). searchTypes is
+  # [movie] so the existing search/music fan-out tests (which mock only
+  # nzbgeek and slug) never reach it; getnzb does not consult searchTypes.
   - name: detailsurl
     enabled: true
     host: https://detailsurl.example.com
@@ -50,6 +50,7 @@ indexers:
     apiHitLimit: 0
     nzbPullLimit: 0
     forceGetnzbRebuild: true
+    downloadFunction: get
     searchTypes: [movie]
 """
 
