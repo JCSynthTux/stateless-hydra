@@ -5,6 +5,10 @@
 # namespaced resource below, so the individual manifests do not have to repeat
 # it. Remember to replace the Secret placeholders (k8s/secret-api-keys.yaml)
 # and the example indexers (k8s/configmap-indexers.yaml) before applying.
+#
+# servicemonitor.yaml requires the Prometheus Operator CRDs. If your cluster
+# does not run the operator, drop that entry (or apply the other manifests
+# individually) so the bundle does not reference the monitoring.coreos.com API.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -17,5 +21,6 @@ resources:
   - secret-api-keys.yaml
   - deployment.yaml
   - service.yaml
+  - servicemonitor.yaml
   - hpa.yaml
   - redis.yaml

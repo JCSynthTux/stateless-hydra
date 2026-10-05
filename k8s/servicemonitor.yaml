@@ -1,0 +1,44 @@
+# ServiceMonitor telling the Prometheus Operator to scrape stateless-hydra's
+# /metrics endpoint (no authentication) through the app Service.
+#
+# Requirements:
+#   * The Prometheus Operator CRDs must be installed in the cluster
+#     (this manifest needs the monitoring.coreos.com/v1 API group).
+#   * The Prometheus instance that should scrape this ServiceMonitor must be
+#     allowed to discover resources in this namespace. Depending on how your
+#     Prometheus is configured, that means either:
+#       - a Prometheus running in the same namespace with
+#         `serviceMonitorSelector` matching the labels below, or
+#       - a cluster-wide Prometheus whose `serviceMonitorNamespaceSelector`
+#         selects `stateless-hydra` (and whose `serviceMonitorSelector`
+#         matches `app: stateless-hydra`).
+#     If your Prometheus restricts namespaces, add the label the operator
+#     expects (commonly `release: <prometheus-name>`) under metadata.labels.
+#
+# Apply directly with:
+#   kubectl apply -f k8s/servicemonitor.yaml
+# or as part of the Kustomize bundle (k8s/kustomization.yaml):
+#   kubectl apply -k k8s/
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: stateless-hydra
+  namespace: stateless-hydra
+  labels:
+    app: stateless-hydra
+    app.kubernetes.io/name: stateless-hydra
+spec:
+  # Discover Services only in this namespace (the Service below carries the
+  # matching `app: stateless-hydra` label).
+  namespaceSelector:
+    matchNames:
+      - stateless-hydra
+  selector:
+    matchLabels:
+      app: stateless-hydra
+  endpoints:
+    # `http` is the port name on the stateless-hydra Service (port 5076).
+    - port: http
+      path: /metrics
+      scheme: http
+      interval: 30s
