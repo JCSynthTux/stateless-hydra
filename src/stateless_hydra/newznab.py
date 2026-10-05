@@ -399,7 +399,13 @@ def render_results(
     ``<enclosure url=... length=... type="application/x-nzb"/>`` is rendered
     (nzbhydra2 parity; AIOStreams' newznab integration drops items without one).
     Each ``attributes`` entry becomes a
-    ``<torznab:attr name=... value=.../>`` element.
+    ``<newznab:attr name=... value=.../>`` element.
+
+    The ``newznab`` namespace is deliberate: this feed serves Usenet (NZB)
+    results, and nzbhydra2 renders NZB attributes as ``newznab:attr`` (torrent
+    results get ``torznab:attr``). AIOStreams' nzbhydra/newznab profile reads
+    only ``newznab:attr``, so emitting ``torznab:attr`` made every attribute --
+    including ``language``, which drives language filters -- invisible to it.
 
     When ``o == "json"`` a JSON-serializable dict is returned with this exact
     shape::
@@ -466,7 +472,7 @@ def render_results(
             etree.SubElement(item_el, "size").text = str(item.size)
         etree.SubElement(item_el, "description").text = item.description
         for name, value in item.attributes.items():
-            etree.SubElement(item_el, _qname(_TORZNAB_NS, "attr"), name=name, value=value)
+            etree.SubElement(item_el, _qname(_NEWZNAB_NS, "attr"), name=name, value=value)
 
     return etree.tostring(rss, xml_declaration=True, encoding="UTF-8").decode("UTF-8")
 

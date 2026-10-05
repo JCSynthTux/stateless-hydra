@@ -327,8 +327,11 @@ def test_render_results_xml_namespaces_response_and_item():
     assert item_el.findtext("size") == str(item.size)
     assert item_el.findtext("description") == item.description
 
-    attrs = {el.get("name"): el.get("value") for el in item_el.findall(f"{{{_TORZNAB_NS}}}attr")}
+    attrs = {el.get("name"): el.get("value") for el in item_el.findall(f"{{{_NEWZNAB_NS}}}attr")}
     assert attrs == item.attributes
+    # NZB results use the newznab namespace (nzbhydra2 parity); AIOStreams'
+    # nzbhydra/newznab profile reads only ``newznab:attr``.
+    assert item_el.findall(f"{{{_TORZNAB_NS}}}attr") == []
 
 
 def test_render_results_round_trips_through_parser():
