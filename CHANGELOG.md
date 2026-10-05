@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## v0.1.3 (2026-10-05)
+
+### Bug Fixes
+
+- **api**: Fetch URL-shaped guids directly and detect upstream error XML in getnzb
+  ([`fb9d4ba`](https://github.com/JCSynthTux/stateless-hydra/commit/fb9d4ba6d0f768e78f882a52d79d24d629d905c5))
+
+
 ## v0.1.2 (2026-10-04)
 
 ### Bug Fixes
