@@ -1,6 +1,34 @@
 # CHANGELOG
 
 
+## v0.3.3 (2026-10-05)
+
+### Bug Fixes
+
+- **api**: Advertise t=get download URLs so AIOStreams hashes items distinctly
+  ([`3a1eb07`](https://github.com/JCSynthTux/stateless-hydra/commit/3a1eb07b8e37c1950e97f740821dbc03328e1684))
+
+AIOStreams identifies an NZB by hashing its URL. Its hashNzbUrl knows the standard /api?t=get&id=...
+  shape and keeps t and id, but does not know t=getnzb, so it fell back to stripping the whole
+  query. Every item then hashed to the same /api value, collapsing all results into one release: the
+  native usenet library conflated them and deduplication kept a single (wrong) file.
+
+Advertise t=get (with the release identity in id) in the item link and enclosure, matching the
+  newznab standard and nzbhydra2's own download link. t=getnzb remains accepted server-side for
+  older clients, and get routes to the same handler.
+
+- **newznab**: Render NZB attributes in the newznab namespace
+  ([`75477f5`](https://github.com/JCSynthTux/stateless-hydra/commit/75477f5a347db3c7abc36407e1055a761732313c))
+
+This feed serves Usenet (NZB) results, and nzbhydra2 renders NZB attributes as newznab:attr (torrent
+  results get torznab:attr). Emitting torznab:attr made every attribute invisible to AIOStreams'
+  nzbhydra/ newznab profile, which reads only newznab:attr -- including the language/subs attributes
+  that drive language filters.
+
+Emit newznab:attr for all result attributes (nzbhydra2 parity) and assert torznab:attr is no longer
+  emitted.
+
+
 ## v0.3.2 (2026-10-05)
 
 ### Bug Fixes
