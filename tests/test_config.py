@@ -4,14 +4,18 @@ All YAML fixtures are written inline into ``tmp_path`` so tests never depend on
 files under ``config/`` (which a later task owns).
 """
 
+import logging
+
 import pytest
 
 from stateless_hydra.config import (
     AppSettings,
+    _ApiKeyRedactionFilter,
     load_api_keys,
     load_indexers,
     load_settings,
     resolve_indexer_key,
+    setup_logging,
 )
 from stateless_hydra.exceptions import ConfigError
 
@@ -344,3 +348,57 @@ def test_invalid_env_value_raises_config_error(tmp_path, monkeypatch):
 
     with pytest.raises(ConfigError):
         load_settings(str(tmp_path / "missing-app.yaml"))
+
+
+def _access_record(path: str) -> logging.LogRecord:
+    """A LogRecord shaped like uvicorn's access log (args tuple form)."""
+    return logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg='%s - "%s %s HTTP/%s" %d',
+        args=("127.0.0.1:1234", "GET", path, "1.1", 200),
+        exc_info=None,
+    )
+
+
+def test_access_log_filter_redacts_apikey_from_path():
+    record = _access_record("/api?t=search&q=ubuntu&apikey=supersecret&limit=5")
+
+    assert _ApiKeyRedactionFilter().filter(record) is True
+
+    rendered = record.getMessage()
+    assert "supersecret" not in rendered
+    assert "apikey=REDACTED" in rendered
+    # Non-secret parameters must survive untouched.
+    assert "q=ubuntu" in rendered
+    assert "limit=5" in rendered
+
+
+def test_access_log_filter_redacts_plain_message_without_args():
+    filter_ = _ApiKeyRedactionFilter()
+    record = logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="proxying /api?t=search&apikey=leaked",
+        args=None,
+        exc_info=None,
+    )
+
+    filter_.filter(record)
+
+    assert "leaked" not in record.getMessage()
+    assert "apikey=REDACTED" in record.getMessage()
+
+
+def test_setup_logging_installs_access_log_filter_once():
+    logger = logging.getLogger("uvicorn.access")
+
+    setup_logging(AppSettings(log_level="CRITICAL"), force=False)
+    setup_logging(AppSettings(log_level="CRITICAL"), force=False)
+
+    filters = [f for f in logger.filters if isinstance(f, _ApiKeyRedactionFilter)]
+    assert len(filters) == 1

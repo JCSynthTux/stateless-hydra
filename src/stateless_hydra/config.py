@@ -219,6 +219,42 @@ def resolve_indexer_key(indexer: IndexerConfig, api_keys: ApiKeysFile) -> str:
         ) from exc
 
 
+_APIKEY_QUERY_PATTERN = re.compile(r"(apikey=)[^&\s\"']+", re.IGNORECASE)
+
+
+class _ApiKeyRedactionFilter(logging.Filter):
+    """Scrub ``apikey`` values from log records.
+
+    Uvicorn's access logger writes the full request line, query string
+    included, so a client's ``apikey`` would otherwise be written to
+    stdout/stderr (and on to any log shipper) in cleartext on every request.
+    The filter rewrites the record's arguments/message before formatting. It
+    also protects the app's own records if they ever embed a request URL.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(self._redact(arg) for arg in record.args)
+        elif isinstance(record.args, dict):
+            record.args = {key: self._redact(value) for key, value in record.args.items()}
+        elif isinstance(record.msg, str):
+            record.msg = self._redact(record.msg)
+        return True
+
+    @staticmethod
+    def _redact(value: object) -> object:
+        if isinstance(value, str):
+            return _APIKEY_QUERY_PATTERN.sub(r"\1REDACTED", value)
+        return value
+
+
+def _install_access_log_redaction() -> None:
+    """Attach the apikey-scrubbing filter to uvicorn's access logger once."""
+    access_logger = logging.getLogger("uvicorn.access")
+    if not any(isinstance(existing, _ApiKeyRedactionFilter) for existing in access_logger.filters):
+        access_logger.addFilter(_ApiKeyRedactionFilter())
+
+
 def setup_logging(settings: AppSettings, *, force: bool = False) -> None:
     """Configure stdlib logging to stderr at ``settings.log_level``.
 
@@ -229,6 +265,8 @@ def setup_logging(settings: AppSettings, *, force: bool = False) -> None:
 
     ``httpx``/``httpcore`` are pinned to ``WARNING``: at ``INFO`` httpx logs the
     full request URL, which would leak upstream indexer API keys into the logs.
+    Uvicorn's access logger is additionally filtered so client ``apikey`` query
+    values never reach the logs (see :class:`_ApiKeyRedactionFilter`).
     """
     logging.basicConfig(
         level=settings.log_level.upper(),
@@ -238,3 +276,4 @@ def setup_logging(settings: AppSettings, *, force: bool = False) -> None:
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    _install_access_log_redaction()
