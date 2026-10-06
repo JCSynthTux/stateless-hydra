@@ -293,6 +293,11 @@ async def _query_indexer(
         return IndexerSearchResult()
 
     params = {**forwarded, "t": effective, "limit": str(indexer_limit)}
+    # Apply the indexer's configured categories when the client did not ask for
+    # specific ones. The field is documented as "None -> all"; without this the
+    # per-indexer ``categories`` setting was parsed but never sent upstream.
+    if indexer.categories and "cat" not in params:
+        params["cat"] = ",".join(str(category) for category in indexer.categories)
     key = cache_key_for(canonical_query(params))
 
     cached = await app.state.cache.get(name, key)

@@ -460,6 +460,45 @@ def test_upstream_limit_is_capped_by_max_results_per_indexer(client, sample_rss)
 
 
 @respx.mock
+def test_indexer_categories_are_forwarded_upstream(tmp_path, fake_redis, sample_rss):
+    """A configured indexer ``categories`` list becomes an upstream ``cat`` param.
+
+    The setting is documented as "None -> all"; a client that sends no ``cat``
+    must have the indexer's configured categories applied. An explicit client
+    ``cat`` wins over the configured default.
+    """
+    (tmp_path / "indexers.yaml").write_text(
+        "indexers:\n"
+        "  - name: catindexer\n"
+        "    host: https://cat.example.com\n"
+        "    apiPath: /api\n"
+        "    apiKeyRef: cat_key\n"
+        "    categories: [2000, 5000]\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "api-keys.yaml").write_text(
+        "apiKeys:\n  cat_key: cat-secret\nhydraApiKeys:\n  - test-key\n",
+        encoding="utf-8",
+    )
+    settings = AppSettings(
+        indexers_file=str(tmp_path / "indexers.yaml"),
+        api_keys_file=str(tmp_path / "api-keys.yaml"),
+        log_level="CRITICAL",
+    )
+    cat_app = create_app(settings, redis_client=fake_redis)
+    route = respx.get("https://cat.example.com/api").mock(
+        return_value=httpx.Response(200, text=sample_rss)
+    )
+
+    with TestClient(cat_app) as cat_client:
+        cat_client.get(API, params={"t": "search", "q": "ubuntu", "apikey": KEY})
+        cat_client.get(API, params={"t": "search", "q": "ubuntu", "cat": "2040", "apikey": KEY})
+
+    assert route.calls[0].request.url.params.get("cat") == "2000,5000"
+    assert route.calls[1].request.url.params.get("cat") == "2040"
+
+
+@respx.mock
 def test_offset_slices_items_but_keeps_total(client, sample_rss):
     respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
     respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
