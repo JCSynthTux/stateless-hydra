@@ -1,6 +1,28 @@
 # CHANGELOG
 
 
+## v0.4.4 (2026-10-06)
+
+### Bug Fixes
+
+- **search**: Forward configured indexer categories upstream
+  ([`222e9bb`](https://github.com/JCSynthTux/stateless-hydra/commit/222e9bbc928a6a9a4ad572296b6f292a872c3590))
+
+The per-indexer categories setting was parsed but never applied: searches were sent without a cat
+  parameter, so results from categories outside the configured list (e.g. PC/0day 4010 on a movie/TV
+  indexer) were returned. Send cat=<comma-joined categories> when the client did not supply its own
+  cat, leaving an explicit client cat untouched.
+
+- **security**: Redact apikey query values from access logs
+  ([`d757d70`](https://github.com/JCSynthTux/stateless-hydra/commit/d757d70c0b713444fac47f05bd2f8db5f826bdaa))
+
+Uvicorn's access logger writes the full request line, query string included, so a client's apikey
+  was written to stdout/stderr (and on to any log shipper) in cleartext on every /api request.
+  Install an idempotent logging.Filter on the uvicorn.access logger that rewrites apikey=... to
+  apikey=REDACTED before formatting. The filter is attached from setup_logging, so it applies to
+  both the image entrypoint and python -m stateless_hydra.
+
+
 ## v0.4.3 (2026-10-05)
 
 ### Bug Fixes
