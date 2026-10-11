@@ -40,6 +40,32 @@ def _slug_rss(base: str) -> str:
     )
 
 
+def _paged_rss(prefix: str, count: int, *, offset: int = 0, total: int | None = None) -> str:
+    """A Newznab feed of ``count`` items ``prefix-<offset>``.. in a fixed order.
+
+    ``total`` becomes the channel-level ``newznab:response total``; ``None``
+    omits the element entirely (to exercise the fetched-item-count fallback).
+    PubDates are identical so the caller's merge order survives the pubDate sort.
+    """
+    items = "".join(
+        "<item>"
+        f"<title>{prefix} {index}</title>"
+        f'<guid isPermaLink="false">{prefix}-{index}</guid>'
+        f"<link>https://example.invalid/{prefix}-{index}</link>"
+        "<pubDate>Mon, 02 Oct 2023 12:00:00 GMT</pubDate>"
+        "<category>5040</category>"
+        "<size>1024</size>"
+        "</item>"
+        for index in range(offset, offset + count)
+    )
+    response = f'<newznab:response offset="{offset}" total="{total}"/>' if total is not None else ""
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<rss version="2.0" xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/">'
+        f"<channel><title>Paged</title>{response}{items}</channel></rss>"
+    )
+
+
 def _items(response_text: str) -> list:
     root = etree.fromstring(response_text.encode("utf-8"))
     return root.findall(".//item")
@@ -511,6 +537,226 @@ def test_offset_slices_items_but_keeps_total(client, sample_rss):
     assert len(_items(response.text)) == 1
     assert _response_total(response.text) == "2"
     assert _guid_prefixes(response.text) == ["nzbgeek"]
+
+
+@respx.mock
+def test_search_total_sums_upstream_totals_not_fetched_items(client, sample_rss):
+    # An indexer may report a channel total larger than the items on this page
+    # (its result set is wider than the slice it returned). The response total
+    # must be the sum of upstream totals (10 + 2), never the number of items
+    # fetched (4).
+    truncated_feed = sample_rss.replace('total="2"', 'total="10"')
+    respx.get(GEEK).mock(return_value=httpx.Response(200, text=truncated_feed))
+    respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
+
+    response = client.get(API, params={"t": "search", "q": "ubuntu", "apikey": KEY})
+
+    assert len(_items(response.text)) == 4
+    assert _response_total(response.text) == "12"
+
+
+@respx.mock
+def test_deep_page_fetches_second_upstream_request_with_offset(client):
+    """A client page past the first window must fetch a second upstream page.
+
+    The issue's exact repro: the indexer cap is 10, the client asks for 5 items
+    at ``offset=10`` (``indexer_limit = min(5, 10) = 5``). The first request
+    fetches its window (5 items), the second starts exactly where the first
+    window ends (``offset=5``) and fetches ``min(10 + 5 - 5, 10) = 10`` items.
+    The two windows are contiguous (upstream ranks 0-14), so the client's
+    ``ordered[10:15]`` slice resolves to the second page's content instead of
+    the empty page the bug produced.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = request.url.params
+        if params.get("offset") == "5":
+            return httpx.Response(200, text=_paged_rss("page", 10, offset=5, total=100))
+        return httpx.Response(200, text=_paged_rss("win", 5, total=100))
+
+    geek = respx.get(GEEK).mock(side_effect=handler)
+
+    response = client.get(
+        API,
+        params={
+            "t": "search",
+            "q": "ubuntu",
+            "apikey": KEY,
+            "indexer": "nzbgeek",
+            "offset": "10",
+            "limit": "5",
+        },
+    )
+
+    titles = [item.findtext("title") for item in _items(response.text)]
+    assert titles == [f"page {index}" for index in range(10, 15)]
+    assert len(titles) == 5
+    # The reported total is the upstream channel total, not the fetched count.
+    assert _response_total(response.text) == "100"
+    second = [call.request for call in geek.calls if call.request.url.params.get("offset") == "5"]
+    assert len(second) == 1
+    assert second[0].url.params.get("offset") == "5"
+    assert second[0].url.params.get("limit") == "10"
+
+
+@respx.mock
+def test_deep_page_when_offset_is_below_the_window_is_contiguous(client):
+    """When offset < indexer_limit the two windows must stay contiguous.
+
+    Client ``offset=3&limit=5`` with a 10-item cap: the first request fetches
+    offsets 0-4 (``indexer_limit = 5``) and the second starts exactly at 5,
+    fetching ``min(3 + 5 - 5, 10) = 3`` items (offsets 5-7). The requested page
+    then resolves to upstream offsets 3-7 with no overlap or duplicate.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = request.url.params
+        start = int(params.get("offset") or 0)
+        count = int(params.get("limit") or 0)
+        return httpx.Response(200, text=_paged_rss("geek", count, offset=start, total=100))
+
+    geek = respx.get(GEEK).mock(side_effect=handler)
+
+    response = client.get(
+        API,
+        params={
+            "t": "search",
+            "q": "ubuntu",
+            "apikey": KEY,
+            "indexer": "nzbgeek",
+            "offset": "3",
+            "limit": "5",
+        },
+    )
+
+    titles = [item.findtext("title") for item in _items(response.text)]
+    assert geek.call_count == 2
+    assert titles == [f"geek {index}" for index in range(3, 8)]
+    assert len(titles) == len(set(titles))
+    second = [call.request for call in geek.calls if call.request.url.params.get("offset") == "5"]
+    assert len(second) == 1
+    assert second[0].url.params.get("limit") == "3"
+
+
+@respx.mock
+def test_deep_page_second_requests_are_cached_separately(client):
+    """Each distinct second-page request is its own cache entry.
+
+    After a search at ``offset=5`` (second request: upstream ``offset=10`` with
+    ``limit=5``), a later search at ``offset=10`` -- whose window request is a
+    cache hit -- must still issue a fresh upstream request for
+    ``offset=10&limit=10``, proving the cache key distinguishes the two
+    second-page requests. ``slug`` is used because it has no daily API-hit cap.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raw = request.url.params.get("offset")
+        start = int(raw) if raw is not None else 0
+        return httpx.Response(200, text=_paged_rss("geek", 10, offset=start, total=100))
+
+    slug = respx.get(SLUG).mock(side_effect=handler)
+
+    base = {"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "slug", "limit": "10"}
+    client.get(API, params={**base, "offset": "5"})
+    assert slug.call_count == 2  # window + offset=10&limit=5
+
+    client.get(API, params={**base, "offset": "10"})
+    # Window request was a cache hit; the offset=10&limit=10 request is new.
+    assert slug.call_count == 3
+    requested = {
+        (call.request.url.params.get("offset"), call.request.url.params.get("limit"))
+        for call in slug.calls
+    }
+    assert requested == {(None, "10"), ("10", "5"), ("10", "10")}
+
+
+@respx.mock
+def test_no_deep_page_fetch_when_offset_is_zero(client):
+    """offset=0 never pays for a second request even when limit exceeds the cap.
+
+    With the default ``limit=100`` capped to 10, an unguarded
+    ``offset + limit > indexer_limit`` would fire a duplicate offset=0 request.
+    """
+
+    geek = respx.get(GEEK).mock(
+        return_value=httpx.Response(200, text=_paged_rss("geek", 10, total=100))
+    )
+
+    response = client.get(
+        API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek"}
+    )
+
+    assert len(_items(response.text)) == 10
+    assert geek.call_count == 1
+    assert geek.calls[0].request.url.params.get("offset") is None
+
+
+@respx.mock
+def test_no_deep_page_fetch_when_first_window_is_exhausted(client, sample_rss):
+    """A first response shorter than the window means no second request.
+
+    nzbgeek returns only 2 items (< the 10-item window), so even a nonzero
+    offset cannot find anything beyond the fetched window.
+    """
+
+    geek = respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+
+    response = client.get(
+        API,
+        params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek", "offset": "1"},
+    )
+
+    assert len(_items(response.text)) == 1
+    assert _response_total(response.text) == "2"
+    assert geek.call_count == 1
+
+
+@respx.mock
+def test_deep_page_request_failure_keeps_first_page_items(client):
+    """A failed offset request must not fail the search; the window survives.
+
+    The limit tracker and error handling treat the second request like any
+    other, but a failure on it is swallowed so the first request's items are
+    still returned (never a 900-style error).
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("offset") == "10":
+            raise httpx.ConnectError("offset request boom")
+        return httpx.Response(200, text=_paged_rss("win", 10, total=100))
+
+    geek = respx.get(GEEK).mock(side_effect=handler)
+
+    response = client.get(
+        API,
+        params={
+            "t": "search",
+            "q": "ubuntu",
+            "apikey": KEY,
+            "indexer": "nzbgeek",
+            "offset": "5",
+            "limit": "10",
+        },
+    )
+
+    assert response.status_code == 200
+    assert 'code="900"' not in response.text
+    titles = [item.findtext("title") for item in _items(response.text)]
+    assert titles == [f"win {index}" for index in range(5, 10)]
+    assert geek.call_count == 2
+
+
+@respx.mock
+def test_response_total_falls_back_to_item_count_without_channel_response(client):
+    """A feed lacking ``newznab:response`` reports the fetched item count."""
+    respx.get(GEEK).mock(return_value=httpx.Response(200, text=_paged_rss("geek", 3)))
+
+    response = client.get(
+        API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek"}
+    )
+
+    assert len(_items(response.text)) == 3
+    assert _response_total(response.text) == "3"
 
 
 @respx.mock
@@ -1168,7 +1414,8 @@ def test_dedupe_by_title_drops_cross_indexer_duplicates(settings, fake_redis, sa
         response = dedupe_client.get(API, params={"t": "search", "q": "ubuntu", "apikey": KEY})
 
     assert len(_items(response.text)) == 2
-    assert _response_total(response.text) == "2"
+    # The channel total sums the upstream totals (2 + 2), independent of dedupe.
+    assert _response_total(response.text) == "4"
 
 
 @respx.mock

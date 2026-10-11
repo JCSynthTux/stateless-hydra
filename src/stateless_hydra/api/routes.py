@@ -266,6 +266,70 @@ class IndexerSearchResult:
     obtained: bool = False
     limit_skipped: bool = False
     error_skipped: bool = False
+    # Upstream channel-level ``newznab:response`` total, carried through so the
+    # aggregated response can report the sum of upstream totals rather than the
+    # number of items fetched. ``None`` when the indexer omitted it.
+    total: int | None = None
+
+
+@dataclass
+class _UpstreamFetch:
+    """Outcome of one cache-aware upstream request for a single indexer."""
+
+    parsed: ParsedRss | None = None
+    limit_skipped: bool = False
+    error_skipped: bool = False
+
+
+async def _fetch_indexer_response(
+    request: Request,
+    name: str,
+    params: dict[str, str],
+    cache_ttl: int,
+) -> _UpstreamFetch:
+    """Fetch one indexer query, honouring the cache, its API-hit budget and errors.
+
+    Shared by the first (window) request and the optional second (deep-page)
+    request a single indexer may issue. Neither mutates shared state, so callers
+    may run this concurrently across indexers. The second request is an
+    additional API hit and is accounted against the same per-indexer budget,
+    exactly like the first.
+    """
+    app = request.app
+    metrics = app.state.metrics
+    client = app.state.clients[name]
+    key = cache_key_for(canonical_query(params))
+
+    cached = await app.state.cache.get(name, key)
+    if cached is not None:
+        metrics.inc_cache_hit(name)
+        parsed = _parse_or_none(name, cached, metrics)
+        if parsed is None:
+            return _UpstreamFetch(error_skipped=True)
+        return _UpstreamFetch(parsed=parsed)
+
+    metrics.inc_cache_miss(name)
+    allowed = await app.state.limits.consume(name, LimitKind.API)
+    await _update_limit_gauge(request, name, LimitKind.API)
+    if not allowed:
+        metrics.inc_limit_reached(name, LimitKind.API.value)
+        return _UpstreamFetch(limit_skipped=True)
+
+    metrics.inc_api_hit(name)
+    try:
+        text = await client.search(params)
+    except IndexerError:
+        logger.warning("indexer %s search failed", name, exc_info=True)
+        metrics.inc_error(name)
+        return _UpstreamFetch(error_skipped=True)
+
+    # Parse before caching: a malformed response must not be cached and
+    # re-served as a permanent error on every subsequent search.
+    parsed = _parse_or_none(name, text, metrics)
+    if parsed is None:
+        return _UpstreamFetch(error_skipped=True)
+    await app.state.cache.set(name, key, text, cache_ttl)
+    return _UpstreamFetch(parsed=parsed)
 
 
 async def _query_indexer(
@@ -273,15 +337,28 @@ async def _query_indexer(
     indexer: IndexerConfig,
     function: str,
     forwarded: dict[str, str],
-    indexer_limit: int,
+    limit: int,
+    offset: int,
 ) -> IndexerSearchResult:
     """Query one indexer, honouring the cache, its API-hit budget and errors.
 
     The result is self-contained (no shared state is written), so callers may
     run this concurrently for every eligible indexer.
+
+    The first request fetches the indexer's window (``indexer_limit`` items from
+    offset 0). When the client's page reaches past that window
+    (``offset + limit > indexer_limit``), a second upstream request is issued
+    starting exactly where the first window ends (upstream ``offset =
+    indexer_limit``) and fetching just enough further items to cover the client's
+    page. Starting the second window at the first's end keeps the per-indexer
+    coverage contiguous, so there is no gap and no overlap between the two
+    responses. The second request uses its own cache key, derived from its own
+    params (including the offset), while sharing the same per-indexer cache store
+    and API-hit budget accounting as the first. A failure or budget skip on it
+    leaves the first request's results intact rather than failing the whole
+    indexer.
     """
     app = request.app
-    metrics = app.state.metrics
     name = indexer.name
     client = app.state.clients[name]
 
@@ -292,44 +369,53 @@ async def _query_indexer(
     else:
         return IndexerSearchResult()
 
+    indexer_limit = min(limit or 100, app.state.settings.max_results_per_indexer)
     params = {**forwarded, "t": effective, "limit": str(indexer_limit)}
     # Apply the indexer's configured categories when the client did not ask for
     # specific ones. The field is documented as "None -> all"; without this the
     # per-indexer ``categories`` setting was parsed but never sent upstream.
     if indexer.categories and "cat" not in params:
         params["cat"] = ",".join(str(category) for category in indexer.categories)
-    key = cache_key_for(canonical_query(params))
 
-    cached = await app.state.cache.get(name, key)
-    if cached is not None:
-        metrics.inc_cache_hit(name)
-        parsed = _parse_or_none(name, cached, metrics)
-        if parsed is None:
-            return IndexerSearchResult(error_skipped=True)
-        return IndexerSearchResult(items=list(parsed.items), obtained=True)
+    first = await _fetch_indexer_response(request, name, params, indexer.cache_ttl_seconds)
+    if first.parsed is None:
+        return IndexerSearchResult(
+            limit_skipped=first.limit_skipped,
+            error_skipped=first.error_skipped,
+        )
 
-    metrics.inc_cache_miss(name)
-    allowed = await app.state.limits.consume(name, LimitKind.API)
-    await _update_limit_gauge(request, name, LimitKind.API)
-    if not allowed:
-        metrics.inc_limit_reached(name, LimitKind.API.value)
-        return IndexerSearchResult(limit_skipped=True)
+    parsed = first.parsed
+    items = list(parsed.items)
+    total = parsed.total
 
-    metrics.inc_api_hit(name)
-    try:
-        text = await client.search(params)
-    except IndexerError:
-        logger.warning("indexer %s search failed", name, exc_info=True)
-        metrics.inc_error(name)
-        return IndexerSearchResult(error_skipped=True)
+    # A first response shorter than the window means the indexer has no results
+    # beyond it, so there is no point issuing (and paying for) a second request.
+    if (
+        offset > 0
+        and indexer_limit > 0
+        and offset + limit > indexer_limit
+        and len(items) >= indexer_limit
+    ):
+        # The second window starts where the first ended, so the two responses
+        # are contiguous. Its size is only what the client's page still needs
+        # beyond the first window, capped at the per-indexer maximum.
+        page_limit = min(offset + limit - indexer_limit, app.state.settings.max_results_per_indexer)
+        page_params = {**params, "offset": str(indexer_limit), "limit": str(page_limit)}
+        second = await _fetch_indexer_response(
+            request, name, page_params, indexer.cache_ttl_seconds
+        )
+        if second.parsed is not None:
+            items.extend(second.parsed.items)
+            # The first response describes the full result set; only fall back to
+            # the second when the first omitted the channel-level total.
+            if total is None:
+                total = second.parsed.total
 
-    # Parse before caching: a malformed response must not be cached and
-    # re-served as a permanent error on every subsequent search.
-    parsed = _parse_or_none(name, text, metrics)
-    if parsed is None:
-        return IndexerSearchResult(error_skipped=True)
-    await app.state.cache.set(name, key, text, indexer.cache_ttl_seconds)
-    return IndexerSearchResult(items=list(parsed.items), obtained=True)
+    return IndexerSearchResult(
+        items=items,
+        obtained=True,
+        total=total,
+    )
 
 
 async def _run_indexer_searches(
@@ -352,18 +438,21 @@ async def _query_indexers(
     function: str,
     forwarded: dict[str, str],
     limit: int,
+    offset: int,
     filter_name: str | None,
-) -> tuple[list[tuple[str, ResultItem]], bool, int, int]:
+) -> tuple[list[tuple[str, ResultItem]], bool, int, int, int | None]:
     """Fan out a search across eligible indexers concurrently and collect items.
 
-    Returns ``(merged, results_obtained, limit_skips, error_skips)``. All
-    eligible indexers are queried in parallel; results are merged in
-    configuration order so the final response is byte-for-byte deterministic.
+    Returns ``(merged, results_obtained, limit_skips, error_skips,
+    upstream_total)``. All eligible indexers are queried in parallel; results
+    are merged in configuration order so the final response is byte-for-byte
+    deterministic. ``upstream_total`` is the sum of the channel-level ``total``
+    values reported by successful indexers, or ``None`` when none reported one
+    (so the caller can fall back to the fetched item count). The client's
+    ``offset`` is threaded through so each indexer can fetch a second page.
     """
     app = request.app
-    settings = app.state.settings
 
-    indexer_limit = min(limit or 100, settings.max_results_per_indexer)
     eligible = [
         indexer
         for name, indexer in app.state.indexers.items()
@@ -372,7 +461,7 @@ async def _query_indexers(
 
     outcomes = await _run_indexer_searches(
         eligible,
-        lambda indexer: _query_indexer(request, indexer, function, forwarded, indexer_limit),
+        lambda indexer: _query_indexer(request, indexer, function, forwarded, limit, offset),
     )
 
     merged: list[tuple[str, ResultItem]] = []
@@ -387,7 +476,9 @@ async def _query_indexers(
         limit_skips += outcome.limit_skipped
         error_skips += outcome.error_skipped
 
-    return merged, results_obtained, limit_skips, error_skips
+    totals = [outcome.total for outcome in outcomes if outcome.total is not None]
+    upstream_total = sum(totals) if totals else None
+    return merged, results_obtained, limit_skips, error_skips, upstream_total
 
 
 def _parse_or_none(name: str, text: str, metrics: Metrics) -> ParsedRss | None:
@@ -455,8 +546,8 @@ async def _handle_search(request: Request, function: str, o: str) -> Response:
     metrics.inc_search(function)
     start = time.monotonic()
     try:
-        merged, results_obtained, limit_skips, error_skips = await _query_indexers(
-            request, function, forwarded, limit, filter_name
+        merged, results_obtained, limit_skips, error_skips, upstream_total = await _query_indexers(
+            request, function, forwarded, limit, offset, filter_name
         )
     finally:
         metrics.observe_search_duration(function, time.monotonic() - start)
@@ -472,7 +563,7 @@ async def _handle_search(request: Request, function: str, o: str) -> Response:
     if request.app.state.settings.dedupe_by_title:
         ordered = _dedupe_by_title(ordered)
 
-    total = len(ordered)
+    total = upstream_total if upstream_total is not None else len(ordered)
     page = ordered[offset : offset + limit]
     items = []
     for name, item in page:
