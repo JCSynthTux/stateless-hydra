@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v0.4.5 (2026-10-11)
+
+### Bug Fixes
+
+- **api**: Report upstream totals and support deep pagination
+  ([`12c7830`](https://github.com/JCSynthTux/stateless-hydra/commit/12c7830298842b5c49aba637de55eea1bcedc766))
+
+### Chores
+
+- **build**: Sync uv.lock to 0.4.4
+  ([`9d3d246`](https://github.com/JCSynthTux/stateless-hydra/commit/9d3d2466c4a11e924f1f80c21611b81b55d975a0))
+
+
 ## v0.4.4 (2026-10-06)
 
 ### Bug Fixes
