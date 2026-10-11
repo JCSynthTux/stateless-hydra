@@ -44,7 +44,7 @@ jobs:
       tag: ${{ steps.release.outputs.tag }}
     steps:
       - name: Checkout (full history)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # semantic-release needs the complete commit history and tags to
           # determine the next version from conventional commits.
@@ -147,7 +147,7 @@ jobs:
       packages: write
     steps:
       - name: Checkout released tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # Build exactly the tag semantic-release created, not the bump commit.
           ref: refs/tags/${{ needs.release.outputs.tag }}
