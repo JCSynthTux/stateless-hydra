@@ -70,11 +70,16 @@ The repo ships `docker-compose.yml` plus example config in `config/`.
    $EDITOR config/indexers.yaml   # add your indexers
    $EDITOR config/api-keys.yaml   # add real indexer keys + a hydra API key
    ```
-2. Start the stack:
+2. Generate the NZB token signing key and export it in the shell that runs
+   Compose (a random secret of at least 32 characters):
+   ```sh
+   export SH_NZB_TOKEN_SIGNING_KEY=$(openssl rand -hex 32)
+   ```
+3. Start the stack:
    ```sh
    docker compose up --build
    ```
-3. Verify:
+4. Verify:
    ```sh
    curl -s "http://localhost:5076/healthz"
    curl -s "http://localhost:5076/api?t=caps&apikey=YOUR_HYDRA_API_KEY"
@@ -84,6 +89,12 @@ The `app` service mounts `./config` read-only at `/config` and talks to the
 `redis` service with no persistence (everything in Redis is cache or daily
 counters). Point Sonarr/Radarr at `http://localhost:5076/api` with one of the
 `hydraApiKeys` values as the API key.
+
+The app requires `SH_NZB_TOKEN_SIGNING_KEY` (a random secret of at least 32
+characters) to sign download tokens; step 2 exports it. `docker-compose.yml`
+declares it with `${SH_NZB_TOKEN_SIGNING_KEY:?...}`, so `docker compose up`
+fails fast with a clear message if it is unset — keep the export in the same
+shell, and reuse the same key across restarts and replicas.
 
 ## Kubernetes quickstart
 
@@ -95,9 +106,11 @@ kubectl apply -k k8s/
 
 Before doing so:
 
-1. Replace the placeholder values in `k8s/secret-api-keys.yaml` — or, better,
-   manage that Secret with External Secrets, SOPS/sealed-secrets, or a cloud
-   secret manager. **Never commit real keys.**
+1. Replace the placeholder values in `k8s/secret-api-keys.yaml` — the indexer
+   keys, the hydra client keys, and `nzbTokenSigningKey` (a random ≥32-character
+   secret for signing download tokens; generate one with `openssl rand -hex 32`)
+   — or, better, manage that Secret with External Secrets, SOPS/sealed-secrets,
+   or a cloud secret manager. **Never commit real keys.**
 2. Replace the example indexers in `k8s/configmap-indexers.yaml`.
 3. Point Redis at your own endpoint by editing `redis_url` in
    `k8s/configmap-app.yaml` (the Service name in `k8s/redis.yaml` by default).
@@ -106,10 +119,11 @@ Before doing so:
    override the ConfigMap.
 
 The Deployment mounts the three config files as read-only sub-paths at
-`/config/app.yaml`, `/config/indexers.yaml` and `/config/api-keys.yaml`,
-runs as non-root with a read-only root filesystem (an `emptyDir` is mounted at
-`/tmp`), and exposes `livenessProbe`/`startupProbe` on `/healthz` and
-`readinessProbe` on `/readyz`.
+`/config/app.yaml`, `/config/indexers.yaml` and `/config/api-keys.yaml`, injects
+`SH_NZB_TOKEN_SIGNING_KEY` from the `stateless-hydra-api-keys` Secret (key
+`nzbTokenSigningKey`), runs as non-root with a read-only root filesystem (an
+`emptyDir` is mounted at `/tmp`), and exposes `livenessProbe`/`startupProbe` on
+`/healthz` and `readinessProbe` on `/readyz`.
 
 ### Troubleshooting: `/readyz` returns 503
 
@@ -128,8 +142,8 @@ can be overridden with `SH_APP_CONFIG`, `SH_INDEXERS_FILE` and
 
 ### `app.yaml` — application settings
 
-All keys are optional; defaults are shown. Environment variables (`SH_*`)
-override file values.
+Every key is optional except `nzb_token_signing_key`, which is **required**;
+defaults are shown. Environment variables (`SH_*`) override file values.
 
 | Key | Default | Env var | Description |
 | --- | --- | --- | --- |
@@ -145,6 +159,14 @@ override file values.
 | `app_config` | `/config/app.yaml` | `SH_APP_CONFIG` | Path to this file. |
 | `indexers_file` | `/config/indexers.yaml` | `SH_INDEXERS_FILE` | Path to the indexers file. |
 | `api_keys_file` | `/config/api-keys.yaml` | `SH_API_KEYS_FILE` | Path to the secrets file. |
+| `nzb_token_signing_key` | *(required, ≥32 chars)* | `SH_NZB_TOKEN_SIGNING_KEY` | Secret HMAC key that signs NZB download tokens. Must come from a Secret, never this file. See [NZB download resolution](#nzb-download-resolution). |
+
+`nzb_token_signing_key` is the one required setting. Supply it through
+`SH_NZB_TOKEN_SIGNING_KEY` sourced from a Kubernetes Secret (the shipped
+manifests use `stateless-hydra-api-keys` → `nzbTokenSigningKey`); it must **not**
+be committed in `app.yaml`, which ships as a non-secret ConfigMap. All replicas
+must share the same key, and rotating it invalidates every outstanding download
+token.
 
 Proxy URLs are passed straight to httpx, which supports `http://`, `https://`,
 `socks5://` and `socks5h://`. SOCKS support is compiled into the image via the
@@ -190,6 +212,11 @@ limit of `0` means unlimited but usage is still counted for metrics.
 | `apiKeys` | `{ref: "real-key"}` | Maps each indexer's `apiKeyRef` to its real API key. |
 | `hydraApiKeys` | `["key", ...]` | API keys clients present to `/api`. Must contain at least one entry (the app refuses to start otherwise). |
 
+In Kubernetes the same Secret (`stateless-hydra-api-keys`) also carries the
+`nzbTokenSigningKey` entry, injected into the pod as `SH_NZB_TOKEN_SIGNING_KEY`
+(see [NZB download resolution](#nzb-download-resolution)). It is a Secret value
+of its own, not part of the mounted `api-keys.yaml` file.
+
 ## How limits work
 
 Each enabled indexer has two independent, daily, Redis-backed budgets:
@@ -212,11 +239,14 @@ share one budget — adding pods does not multiply it.
 
 A search result carries a **composed guid** of the form `INDEXER:TOKEN`. When a
 client requests `t=getnzb&id=INDEXER:TOKEN`, stateless-hydra resolves the
-download from the owning indexer. Upstream URLs are derived **at search time**
-and stored server-side in Redis under an opaque token, so **no upstream URL —
-and no indexer API key** — is ever sent to the client.
+download from the owning indexer. The token is a **deterministic, signed and
+encrypted** encoding of the result's original upstream guid, so **no upstream
+URL — and no indexer API key** — is ever sent to the client. Nothing is stored
+server-side: rendering the same search twice produces byte-identical tokens and
+writes no Redis keys.
 
-For each result, stateless-hydra derives the upstream download URL:
+At download time, stateless-hydra derives the upstream URL from the recovered
+guid:
 
 - **URL-shaped guid** (`http(s)://…`) with `forceGetnzbRebuild: false`
   (the default) → the URL *is* the download (altHUB-style `.nzb` URLs, and nZEDb
@@ -224,13 +254,34 @@ For each result, stateless-hydra derives the upstream download URL:
 - **Otherwise** → the download is rebuilt as
   `t=<downloadFunction>&id=<guid>` against the indexer's API.
 
-The derived URL is stored at `stateless_hydra:nzb:{token}` (JSON
-`{"indexer":…,"url":…}`) with a **14-day TTL**, and the client-facing guid
-becomes `{indexer}:{token}`. `t=getnzb` looks the token up in Redis, verifies it
-belongs to the named indexer, and fetches the stored URL. Missing, expired or
-mismatched tokens return Newznab error `300`. Because tokens live in the shared
-Redis, **Redis is required for downloads** (as it already is for the cache and
-daily limits) and any replica can serve any token.
+The token is derived per `(indexer, original guid)` with an HMAC-based
+encrypt-then-MAC construction keyed by `SH_NZB_TOKEN_SIGNING_KEY`, and is bound
+to a rolling daily time bucket. `t=getnzb` verifies the token against the
+indexer named in the composed guid and rebuilds the upstream URL from the
+recovered guid — no lookup and no shared state. A token is accepted for the
+**current and previous day bucket** (roughly 24–48 h), so a link minted just
+before the daily rollover keeps working for a full day. Missing, malformed,
+expired or wrong-indexer tokens return Newznab error `300`.
+
+**Signing key.** `SH_NZB_TOKEN_SIGNING_KEY` is required (at least 32
+characters; the app refuses to start without it) and must be supplied from a
+Kubernetes Secret (`stateless-hydra-api-keys` → `nzbTokenSigningKey` in the
+shipped manifests), never from `app.yaml` or a ConfigMap. All replicas must
+share the same key, so any replica can serve any token. Rotating the key
+invalidates every outstanding token — clients must re-run their search.
+
+**Grab counting.** Every NZB fetched from an indexer consumes one unit of that
+indexer's daily `nzbPullLimit`, and repeated grabs of the same token each count
+again. This is intentional indexer-budget protection, not double-counting.
+
+**Backwards compatibility.** Download links minted by earlier versions — opaque
+tokens resolved through a Redis lookup with a 14-day TTL — remain valid until
+their original expiry. **Redis is not required for downloads** with the new
+tokens; it is still used for the search cache and the daily limits.
+
+**Known limits.** The token length grows with the guid, so a long URL-shaped
+guid yields a long download URL. Token lifetime is bucket-bound (about 1–2 days)
+rather than a configurable TTL.
 
 **How the guid is chosen.** stateless-hydra takes the guid from the indexer's
 RSS. When the RSS marks it `isPermaLink="true"`, the item's `<link>` is used as
@@ -258,10 +309,9 @@ A details-page URL guid (fetching it returns HTML) needs
 `forceGetnzbRebuild: true`; pick `downloadFunction` for the function the indexer
 implements (`get` for nZEDb classic, `getnzb` otherwise).
 
-Tokens expire after 14 days: re-run a search to get a fresh download link if a
-client kept an old one. Upstream Newznab error documents are detected and
-translated on the resolution path, so a misconfigured option surfaces a clear
-Newznab error instead of streaming HTML or an error body as a fake NZB.
+Upstream Newznab error documents are detected and translated on the resolution
+path, so a misconfigured option surfaces a clear Newznab error instead of
+streaming HTML or an error body as a fake NZB.
 
 ## Caching
 
