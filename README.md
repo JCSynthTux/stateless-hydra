@@ -38,19 +38,27 @@ runtime state lives in Redis.
 
 ## Architecture
 
-```
-  Sonarr / Radarr / any Newznab client
-                 |
-                 |  Newznab/Torznab HTTP  (port 5076,  /api?apikey=...)
-                 v
-        +-------------------+          +----------------------+
-        |  stateless-hydra  | <------> |        Redis         |
-        |  (stateless pods) |  cache   |  search cache and    |
-        +-------------------+  limits  |  daily limit counters|
-                 |                    +----------------------+
-                 |  fan-out over HTTP (httpx)
-                 v
-   Usenet indexers  (Newznab / Torznab: NZBgeek, ...)
+```mermaid
+flowchart LR
+    C["Sonarr · Radarr · Lidarr<br/>any Newznab client"]
+    M["Prometheus"]
+
+    subgraph HYDRA["stateless-hydra — stateless pods × N"]
+        H["auth · fan-out · merge · dedupe<br/>daily limits · deterministic encrypted<br/>NZB tokens · /metrics"]
+    end
+
+    subgraph STATE["Shared state"]
+        R[("Redis — search cache<br/>daily limit counters")]
+    end
+
+    P["optional proxy<br/>http / https / socks5"]
+    I["Usenet indexers<br/>Newznab / Torznab<br/>NZBgeek · altHUB · drunkenSlug · …"]
+
+    C -- "Newznab/Torznab HTTP<br/>port 5076 · /api?apikey=…" --> H
+    H <-- "cache + limits<br/>shared across replicas" --> R
+    H -- "concurrent fan-out<br/>per-indexer keys · UA · timeouts" --> P
+    P -- "searches and getnzb NZB pulls" --> I
+    M -- "scrape /metrics (port 5076)" --> H
 ```
 
 - Clients authenticate against **hydra API keys** (`hydraApiKeys`).
@@ -59,7 +67,7 @@ runtime state lives in Redis.
   (`apiKeys`); total latency tracks the slowest indexer rather than their sum.
 - Results are merged, optionally de-duplicated and cached in Redis.
 - `getnzb` downloads are routed back to the owning indexer via the composed
-  guid (`<indexer>:<original-guid>`).
+  guid (`<indexer>:<token>`), resolved statelessly (no Redis lookup).
 
 ## Quickstart (Docker Compose)
 
