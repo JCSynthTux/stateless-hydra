@@ -26,6 +26,10 @@ services:
       - "5076:5076"
     environment:
       SH_REDIS_URL: redis://redis:6379/0
+      # Required HMAC key (>=32 chars) for deterministic NZB tokens. Compose
+      # aborts with the message below if it is unset; generate one with
+      # `export SH_NZB_TOKEN_SIGNING_KEY=$(openssl rand -hex 32)`.
+      SH_NZB_TOKEN_SIGNING_KEY: ${SH_NZB_TOKEN_SIGNING_KEY:?set it to a random >=32-char secret, e.g. `export SH_NZB_TOKEN_SIGNING_KEY=$(openssl rand -hex 32)`}
     volumes:
       - ./config:/config:ro
     depends_on:

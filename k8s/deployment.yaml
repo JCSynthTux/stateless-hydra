@@ -8,6 +8,10 @@
 #   /config/app.yaml        ConfigMap stateless-hydra-app
 #   /config/indexers.yaml   ConfigMap stateless-hydra-indexers
 #   /config/api-keys.yaml   Secret    stateless-hydra-api-keys (AGENTS.md rule 2)
+#
+# The NZB token signing key is secret too: it is injected as the
+# SH_NZB_TOKEN_SIGNING_KEY env var from the stateless-hydra-api-keys Secret
+# (see `env:` below) rather than living in the app-config ConfigMap.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -43,6 +47,18 @@ spec:
             - name: http
               containerPort: 5076
               protocol: TCP
+          env:
+            # NZB token signing key (HMAC key material for deterministic
+            # download tokens). It is a SECRET, so it comes from the
+            # stateless-hydra-api-keys Secret -- never from the app-config
+            # ConfigMap or the image (AGENTS.md rule 2). Replace the
+            # placeholder `nzbTokenSigningKey` value in
+            # k8s/secret-api-keys.yaml before deploying.
+            - name: SH_NZB_TOKEN_SIGNING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: stateless-hydra-api-keys
+                  key: nzbTokenSigningKey
           # redis_url comes from the mounted app-config ConfigMap
           # (redis_url: in k8s/configmap-app.yaml). Do not set SH_REDIS_URL
           # here: SH_* env vars override the config file.
