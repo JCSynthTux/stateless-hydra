@@ -60,10 +60,12 @@ indexers_file: "/config/indexers.yaml"
 api_keys_file: "/config/api-keys.yaml"
 
 # Secret HMAC key (>=32 characters) used to sign deterministic NZB download
-# tokens. This file ships as a non-secret ConfigMap in Kubernetes, so NEVER
-# set a real key here -- supply it as a Secret and let it reach the process via
-# the SH_NZB_TOKEN_SIGNING_KEY environment variable instead
-# (k8s/secret-api-keys.yaml -> secretKeyRef in k8s/deployment.yaml).
-# Leaving the key unset here is expected in production.
+# tokens. OPTIONAL override: the primary source is the `nzbTokenSigningKey`
+# field of the mounted /config/api-keys.yaml secret file (see
+# config/api-keys.yaml and k8s/secret-api-keys.yaml). This file ships as a
+# non-secret ConfigMap in Kubernetes, so never set a real key here; setting the
+# SH_NZB_TOKEN_SIGNING_KEY environment variable is the supported override for
+# non-Kubernetes setups. If neither source provides a key >=32 characters the
+# app fails fast at startup.
 # env: SH_NZB_TOKEN_SIGNING_KEY
 # nzb_token_signing_key: "CHANGE_ME_BEFORE_DEPLOY"

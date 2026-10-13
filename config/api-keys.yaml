@@ -12,6 +12,12 @@
 #                 `apiKeyRef` field of an indexer in indexers.yaml.
 #   hydraApiKeys  the API keys clients (Sonarr, Radarr, ...) use to call
 #                 /api. At least one entry is required.
+#   nzbTokenSigningKey
+#                 secret HMAC key (>=32 characters) that signs deterministic NZB
+#                 download tokens. Generate one with `openssl rand -hex 32`.
+#                 If it is missing or shorter than 32 characters the app fails
+#                 fast at startup with a clear error. An app.yaml value or the
+#                 SH_NZB_TOKEN_SIGNING_KEY environment variable overrides it.
 # =============================================================================
 
 apiKeys:
@@ -20,3 +26,7 @@ apiKeys:
 
 hydraApiKeys:
   - "CHANGE_ME"
+
+# Replace with `openssl rand -hex 32`. The placeholder below is <32 characters,
+# so a forgotten replacement refuses to start rather than booting with a known key.
+nzbTokenSigningKey: "CHANGE_ME_BEFORE_DEPLOY"
