@@ -291,9 +291,15 @@ def test_missing_api_keys_file_raises_config_error(tmp_path):
         load_api_keys(str(tmp_path / "missing-api-keys.yaml"))
 
 
+_TEST_SIGNING_KEY = "unit-test-signing-key-0123456789abcdef"
+
+
 def _clear_sh_env(monkeypatch):
     for field_name in AppSettings.model_fields:
         monkeypatch.delenv(f"SH_{field_name.upper()}", raising=False)
+    # ``nzb_token_signing_key`` is required; give tests a valid value so only
+    # the setting under test controls the outcome.
+    monkeypatch.setenv("SH_NZB_TOKEN_SIGNING_KEY", _TEST_SIGNING_KEY)
 
 
 def test_settings_defaults_when_nothing_set(tmp_path, monkeypatch):
@@ -309,6 +315,78 @@ def test_settings_defaults_when_nothing_set(tmp_path, monkeypatch):
     assert settings.global_proxy_url is None
     assert settings.host == "0.0.0.0"
     assert settings.port == 5076
+    assert settings.nzb_token_signing_key == _TEST_SIGNING_KEY
+
+
+def test_missing_nzb_token_signing_key_raises_config_error(tmp_path, monkeypatch):
+    for field_name in AppSettings.model_fields:
+        monkeypatch.delenv(f"SH_{field_name.upper()}", raising=False)
+
+    with pytest.raises(ConfigError):
+        load_settings(str(tmp_path / "missing-app.yaml"))
+
+
+def test_empty_nzb_token_signing_key_raises_config_error(tmp_path, monkeypatch):
+    _clear_sh_env(monkeypatch)
+    monkeypatch.setenv("SH_NZB_TOKEN_SIGNING_KEY", "   ")
+
+    with pytest.raises(ConfigError):
+        load_settings(str(tmp_path / "missing-app.yaml"))
+
+
+def test_short_nzb_token_signing_key_raises_config_error(tmp_path, monkeypatch):
+    _clear_sh_env(monkeypatch)
+    monkeypatch.setenv("SH_NZB_TOKEN_SIGNING_KEY", "too-short")
+
+    with pytest.raises(ConfigError):
+        load_settings(str(tmp_path / "missing-app.yaml"))
+
+
+def test_nzb_token_signing_key_from_yaml_only(tmp_path, monkeypatch):
+    # A key supplied only in app.yaml (no SH_* env var) must be accepted: the
+    # required-value check runs on the merged config, not before the YAML read.
+    _clear_sh_env(monkeypatch)
+    monkeypatch.delenv("SH_NZB_TOKEN_SIGNING_KEY", raising=False)
+    path = _write(
+        tmp_path,
+        "app.yaml",
+        "nzb_token_signing_key: yaml-only-signing-key-0123456789abc\n",
+    )
+
+    settings = load_settings(path)
+
+    assert settings.nzb_token_signing_key == "yaml-only-signing-key-0123456789abc"
+
+
+def test_sh_app_config_env_selects_yaml_path(tmp_path, monkeypatch):
+    # F1 regression: the app YAML path must come from SH_APP_CONFIG when set
+    # (the path was briefly hardcoded to the default and the env var ignored).
+    _clear_sh_env(monkeypatch)
+    # Drop the helper's env key so the key inside the selected YAML is used,
+    # proving the file at SH_APP_CONFIG -- not the default path -- was read.
+    monkeypatch.delenv("SH_NZB_TOKEN_SIGNING_KEY", raising=False)
+    path = _write(
+        tmp_path,
+        "app.yaml",
+        "port: 6100\nnzb_token_signing_key: env-selected-signing-key-0123456789\n",
+    )
+    monkeypatch.setenv("SH_APP_CONFIG", path)
+
+    settings = load_settings()
+
+    assert settings.port == 6100
+    assert settings.nzb_token_signing_key == "env-selected-signing-key-0123456789"
+
+
+def test_nzb_token_signing_key_is_stripped(tmp_path, monkeypatch):
+    # F3: the model stores the stripped key so the length check and the HMAC
+    # key material agree.
+    _clear_sh_env(monkeypatch)
+    monkeypatch.setenv("SH_NZB_TOKEN_SIGNING_KEY", f"  {_TEST_SIGNING_KEY}  ")
+
+    settings = load_settings(str(tmp_path / "missing-app.yaml"))
+
+    assert settings.nzb_token_signing_key == _TEST_SIGNING_KEY
 
 
 def test_settings_yaml_values_load(tmp_path, monkeypatch):
@@ -397,8 +475,12 @@ def test_access_log_filter_redacts_plain_message_without_args():
 def test_setup_logging_installs_access_log_filter_once():
     logger = logging.getLogger("uvicorn.access")
 
-    setup_logging(AppSettings(log_level="CRITICAL"), force=False)
-    setup_logging(AppSettings(log_level="CRITICAL"), force=False)
+    setup_logging(
+        AppSettings(log_level="CRITICAL", nzb_token_signing_key=_TEST_SIGNING_KEY), force=False
+    )
+    setup_logging(
+        AppSettings(log_level="CRITICAL", nzb_token_signing_key=_TEST_SIGNING_KEY), force=False
+    )
 
     filters = [f for f in logger.filters if isinstance(f, _ApiKeyRedactionFilter)]
     assert len(filters) == 1

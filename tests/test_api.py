@@ -7,6 +7,7 @@ services are required.
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 
@@ -17,6 +18,7 @@ from fakeredis import aioredis
 from fastapi.testclient import TestClient
 from lxml import etree
 
+from stateless_hydra import tokens
 from stateless_hydra.config import AppSettings
 from stateless_hydra.exceptions import ConfigError
 from stateless_hydra.main import create_app
@@ -78,6 +80,11 @@ def _guids(response_text: str) -> list[str]:
 def _enclosures(response_text: str) -> list:
     """The ``<enclosure>`` element of each item (``None`` when absent)."""
     return [item.find("enclosure") for item in _items(response_text)]
+
+
+def _b64url_decode(value: str) -> bytes:
+    """Decode a padding-stripped base64url token part."""
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
 def _aiostreams_surviving_items(response_text: str) -> list:
@@ -510,6 +517,7 @@ def test_indexer_categories_are_forwarded_upstream(tmp_path, fake_redis, sample_
         indexers_file=str(tmp_path / "indexers.yaml"),
         api_keys_file=str(tmp_path / "api-keys.yaml"),
         log_level="CRITICAL",
+        nzb_token_signing_key="test-signing-key-0123456789abcdef",
     )
     cat_app = create_app(settings, redis_client=fake_redis)
     route = respx.get("https://cat.example.com/api").mock(
@@ -1038,6 +1046,8 @@ def test_getnzb_permalink_guid_is_replaced_by_direct_link(client):
 def test_search_response_never_leaks_upstream_url_or_indexer_key(client):
     # Regression: upstream URLs may embed indexer API keys (drunkenSlug's r=).
     # Neither the URL nor any of its query tokens may appear in the client XML.
+    # Literal substrings are not enough: the token is encrypted, so base64-decode
+    # every part and confirm the plaintext guid is absent from the raw bytes too.
     nzb_url = "https://api.althub.co.za/getnzb/abc.nzb&i=1&r=SECRETKEY"
     rss = _single_item_rss(nzb_url, link="https://api.althub.co.za/details/abc")
     respx.get(GEEK, params={"t": "search"}).mock(return_value=httpx.Response(200, text=rss))
@@ -1055,6 +1065,14 @@ def test_search_response_never_leaks_upstream_url_or_indexer_key(client):
         assert "https://" not in block
         assert "r=" not in block
         assert "i=" not in block
+
+    token = _guids(response.text)[0].split(":", 1)[1]
+    parts = token.split(".")
+    assert len(parts) == 3
+    decoded = b"".join(_b64url_decode(part) for part in parts)
+    assert b"SECRETKEY" not in decoded
+    assert b"api.althub.co.za" not in decoded
+    assert nzb_url.encode() not in decoded
 
 
 @respx.mock
@@ -1125,44 +1143,151 @@ def test_getnzb_token_indexer_mismatch_yields_300(client, sample_rss):
 
 
 @respx.mock
-async def test_nzb_token_ttl_is_positive(settings, fake_redis, sample_rss):
+async def test_search_render_writes_no_nzb_token_keys(settings, fake_redis, sample_rss):
+    # The growth fix: signed tokens are derived from the guid, so rendering a
+    # search writes no per-item Redis token key at all -- yet the rendered guid
+    # still resolves to a working download.
     app = create_app(settings, redis_client=fake_redis)
     respx.get(GEEK, params={"t": "search"}).mock(return_value=httpx.Response(200, text=sample_rss))
+    respx.get(GEEK, params={"t": "getnzb"}).mock(
+        return_value=httpx.Response(200, content=b"real-nzb")
+    )
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
         response = await ac.get(
             API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek"}
         )
+        token_keys = await fake_redis.keys("stateless_hydra:nzb:*")
+        url = httpx.URL(_enclosures(response.text)[0].get("url"))
+        download = await ac.get(url.path, params=dict(url.params))
 
     assert response.status_code == 200
-    token = _guids(response.text)[0].split(":", 1)[1]
-    ttl = await fake_redis.ttl(f"stateless_hydra:nzb:{token}")
-    assert ttl > 0
+    assert list(token_keys) == []
+    assert download.status_code == 200
+    assert download.content == b"real-nzb"
 
 
 @respx.mock
-async def test_nzb_token_stores_derived_upstream_url(settings, fake_redis, sample_rss):
-    # The token payload must hold the upstream URL derived at search time, not
-    # anything the client sent. Here nzbgeek's non-URL guid is rebuilt via the
-    # default downloadFunction.
+async def test_nzb_token_round_trips_to_derived_upstream_url(settings, fake_redis, sample_rss):
+    # The token embeds the original upstream guid; getnzb must rebuild the exact
+    # same derived upstream URL the old Redis-stored payload used to carry. Here
+    # nzbgeek's non-URL guid is rebuilt via the default downloadFunction.
     app = create_app(settings, redis_client=fake_redis)
     respx.get(GEEK, params={"t": "search"}).mock(return_value=httpx.Response(200, text=sample_rss))
+    upstream = respx.get(GEEK, params={"t": "getnzb"}).mock(
+        return_value=httpx.Response(200, content=b"real-nzb")
+    )
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
         response = await ac.get(
             API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek"}
         )
+        url = httpx.URL(_enclosures(response.text)[0].get("url"))
+        download = await ac.get(url.path, params=dict(url.params))
+
+    assert download.status_code == 200
+    assert download.content == b"real-nzb"
+    assert upstream.call_count == 1
+    requested = upstream.calls[0].request
+    assert str(requested.url).startswith("https://nzbgeek.example.com/api?")
+    assert requested.url.params.get("t") == "getnzb"
+    assert requested.url.params.get("id") == "guid-one"
+
+
+@respx.mock
+def test_repeat_render_is_byte_identical(client, sample_rss):
+    # Two identical searches (the second served from the cache) must produce
+    # byte-for-byte the same response, tokens included: nothing random or
+    # clock-dependent leaks into a same-bucket render.
+    search_route = respx.get(GEEK, params={"t": "search"}).mock(
+        return_value=httpx.Response(200, text=sample_rss)
+    )
+    params = {"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek"}
+
+    first = client.get(API, params=params)
+    second = client.get(API, params=params)
+
+    assert first.text == second.text
+    assert _guids(first.text) == _guids(second.text)
+    # The second render was a cache hit, so no upstream call was needed.
+    assert search_route.call_count == 1
+
+
+@respx.mock
+async def test_tokens_are_stable_across_cache_expiry(settings, fake_redis, sample_rss):
+    # Tokens are deterministic, not cache-derived: after the search cache is
+    # dropped (as it would be on TTL expiry) an identical re-fetch renders the
+    # exact same guids.
+    app = create_app(settings, redis_client=fake_redis)
+    respx.get(GEEK, params={"t": "search"}).mock(return_value=httpx.Response(200, text=sample_rss))
+    params = {"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek"}
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
+        first = await ac.get(API, params=params)
+        await fake_redis.flushall()
+        second = await ac.get(API, params=params)
+
+    assert first.text == second.text
+    assert _guids(first.text) == _guids(second.text)
+
+
+@respx.mock
+async def test_signed_token_expires_after_bucket_rollover(
+    monkeypatch, settings, fake_redis, sample_rss
+):
+    # Once the bucket has rolled twice the token's signing bucket is neither
+    # current nor previous, so getnzb rejects it with the same 300 as an unknown
+    # token (and never contacts the upstream).
+    app = create_app(settings, redis_client=fake_redis)
+    respx.get(GEEK, params={"t": "search"}).mock(return_value=httpx.Response(200, text=sample_rss))
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
+        search = await ac.get(
+            API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek"}
+        )
+        token = _guids(search.text)[0].split(":", 1)[1]
+        original_bucket = tokens._day_bucket
+        monkeypatch.setattr(tokens, "_day_bucket", lambda now=None: original_bucket(now) + 2)
+        response = await ac.get(
+            API, params={"t": "getnzb", "id": f"nzbgeek:{token}", "apikey": KEY}
+        )
 
     assert response.status_code == 200
-    token = _guids(response.text)[0].split(":", 1)[1]
-    raw = await fake_redis.get(f"stateless_hydra:nzb:{token}")
-    data = json.loads(raw)
-    assert data["indexer"] == "nzbgeek"
-    assert data["url"].startswith("https://nzbgeek.example.com/api?")
-    assert "t=getnzb" in data["url"]
-    assert "id=guid-one" in data["url"]
+    assert 'code="300"' in response.text
+    assert "token expired or unknown" in response.text
+
+
+@respx.mock
+async def test_legacy_stored_token_still_resolves(settings, fake_redis):
+    # Backwards compatibility: tokens minted by v0.4.5 stored their resolved URL
+    # in Redis under ``stateless_hydra:nzb:<token>``. Those must keep working
+    # until their TTL expires, even though new renders write no such key.
+    app = create_app(settings, redis_client=fake_redis)
+    upstream = respx.get(GEEK, params={"t": "getnzb", "id": "legacy-guid"}).mock(
+        return_value=httpx.Response(200, content=b"legacy-nzb")
+    )
+    legacy_token = "legacy-opaque-token-from-v0.4.5"
+    await fake_redis.set(
+        f"stateless_hydra:nzb:{legacy_token}",
+        json.dumps(
+            {"indexer": "nzbgeek", "url": "https://nzbgeek.example.com/api?t=getnzb&id=legacy-guid"}
+        ),
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
+        response = await ac.get(
+            API, params={"t": "getnzb", "id": f"nzbgeek:{legacy_token}", "apikey": KEY}
+        )
+
+    assert response.status_code == 200
+    assert response.content == b"legacy-nzb"
+    assert response.headers["content-type"] == "application/x-nzb"
+    assert upstream.call_count == 1
 
 
 @respx.mock
@@ -1245,6 +1370,7 @@ def test_getnzb_rebuild_defaults_to_getnzb(tmp_path, fake_redis):
         indexers_file=str(tmp_path / "indexers.yaml"),
         api_keys_file=str(tmp_path / "api-keys.yaml"),
         log_level="CRITICAL",
+        nzb_token_signing_key="test-signing-key-0123456789abcdef",
     )
     default_app = create_app(settings, redis_client=fake_redis)
 
@@ -1517,6 +1643,7 @@ def test_empty_hydra_api_keys_raises_config_error(tmp_path):
     settings = AppSettings(
         indexers_file=str(tmp_path / "indexers.yaml"),
         api_keys_file=str(tmp_path / "api-keys.yaml"),
+        nzb_token_signing_key="test-signing-key-0123456789abcdef",
     )
 
     with pytest.raises(ConfigError):

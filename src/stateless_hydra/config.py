@@ -22,10 +22,19 @@ from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .exceptions import ConfigError
+
+# Minimum length required of the NZB token signing key. The key is HMAC key
+# material; a short/guessable key would let a client forge download tokens.
+_MIN_SIGNING_KEY_LENGTH = 32
+
+# Default location of the YAML app configuration. Also the ``app_config`` field
+# default, kept as a module constant so ``load_settings`` can locate the file
+# before constructing (and validating) any settings object.
+_DEFAULT_APP_CONFIG = "/config/app.yaml"
 
 _VALID_SEARCH_TYPES = {"search", "tvsearch", "movie", "music", "book"}
 _RESET_TIME_PATTERN = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
@@ -114,9 +123,33 @@ class AppSettings(BaseSettings):
     global_proxy_url: str | None = None
     host: str = "0.0.0.0"
     port: int = 5076
-    app_config: str = "/config/app.yaml"
+    app_config: str = _DEFAULT_APP_CONFIG
     indexers_file: str = "/config/indexers.yaml"
     api_keys_file: str = "/config/api-keys.yaml"
+    # Secret (SH_NZB_TOKEN_SIGNING_KEY) used to sign deterministic NZB download
+    # tokens. Required: without it every request would mint unsigned tokens.
+    # Validation is a model-level check so it runs whether the key arrives via
+    # ``SH_NZB_TOKEN_SIGNING_KEY`` or the YAML app config -- and still fails
+    # fast at load time when neither provides one.
+    nzb_token_signing_key: str = ""
+
+    @field_validator("nzb_token_signing_key")
+    @classmethod
+    def _strip_nzb_token_signing_key(cls, value: str) -> str:
+        # Store the stripped value: whitespace is not part of the key material,
+        # and the length check below must agree with what tokens.py signs with.
+        return value.strip()
+
+    @model_validator(mode="after")
+    def _validate_nzb_token_signing_key(self) -> AppSettings:
+        if len(self.nzb_token_signing_key) < _MIN_SIGNING_KEY_LENGTH:
+            raise ValueError(
+                "nzb_token_signing_key must be at least "
+                f"{_MIN_SIGNING_KEY_LENGTH} characters; set it via the "
+                "SH_NZB_TOKEN_SIGNING_KEY environment variable sourced from a "
+                "Kubernetes Secret (never a plaintext ConfigMap/app.yaml value)"
+            )
+        return self
 
 
 def _env_overrides() -> dict[str, str]:
@@ -149,19 +182,24 @@ def _read_yaml_mapping(path: Path, description: str) -> dict:
 
 
 def load_settings(app_config: str | None = None) -> AppSettings:
-    """Load :class:`AppSettings`.
+    """Load :class:`AppSettings` from an app YAML file plus ``SH_*`` env vars.
 
-    YAML values from ``app_config`` form the base; ``SH_*`` environment
-    variables always win. When ``app_config`` is ``None`` the configured
-    default path (``app_config`` field) is used. A missing file is not an
-    error: environment variables and defaults are used instead.
+    Path resolution: an explicit ``app_config`` argument wins; otherwise the
+    ``SH_APP_CONFIG`` environment variable is honored; otherwise the documented
+    default path (``/config/app.yaml``) is used. A missing file is not an error
+    -- defaults and environment variables are used instead.
+
+    The resolved YAML mapping and the explicitly-set ``SH_*`` environment
+    variables are merged (environment values override YAML), then validated
+    exactly once by constructing :class:`AppSettings`. Deferring validation
+    until after the merge means a signing key supplied only in the YAML file is
+    accepted, while an environment-only key also works and neither supplied
+    fails fast with :class:`~stateless_hydra.exceptions.ConfigError`.
     """
-    try:
-        defaults = AppSettings()
-    except ValidationError as exc:
-        raise ConfigError(f"invalid application settings (environment): {exc}") from exc
-
-    path = Path(app_config) if app_config is not None else Path(defaults.app_config)
+    if app_config is not None:
+        path = Path(app_config)
+    else:
+        path = Path(os.environ.get("SH_APP_CONFIG", _DEFAULT_APP_CONFIG))
 
     yaml_data: dict = {}
     if path.is_file():

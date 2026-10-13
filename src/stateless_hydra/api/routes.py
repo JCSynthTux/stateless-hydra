@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import secrets
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
@@ -49,6 +48,7 @@ from ..newznab import (
     render_results,
     split_guid,
 )
+from ..tokens import sign, verify
 
 logger = logging.getLogger(__name__)
 
@@ -89,10 +89,13 @@ _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 # Client-facing NZB downloads are addressed by an opaque token, never by the
 # upstream URL: that URL may embed an indexer API key (e.g. drunkenSlug's
-# ``r=`` parameter). Tokens live in Redis for two weeks so an advertised NZB
-# stays grabbable well after the search that produced it; Redis is the shared
-# store across replicas, so any pod can resolve any token.
-_NZB_TOKEN_TTL = 14 * 24 * 3600
+# ``r=`` parameter). The token encrypts the original upstream guid with a
+# deterministic, keyed construction and authenticates it with an HMAC tag (see
+# :mod:`stateless_hydra.tokens`), so the guid plaintext never appears in the
+# response, repeat renders are byte-identical, the signing key never appears in
+# a token, and no per-request state is written. Legacy v0.4.5-era tokens stored
+# their resolved URL in Redis for two weeks; those are still resolved from
+# Redis until they expire.
 _NZB_TOKEN_PREFIX = "stateless_hydra:nzb"
 
 
@@ -567,18 +570,11 @@ async def _handle_search(request: Request, function: str, o: str) -> Response:
     page = ordered[offset : offset + limit]
     items = []
     for name, item in page:
-        owner = request.app.state.indexers[name]
-        client = request.app.state.clients[name]
-        upstream_url = _derive_download_url(owner, client, item.guid)
-        # The upstream URL may embed an indexer API key, so it is stored
-        # server-side and only an opaque token is rendered to the client. On a
-        # cache-hit re-render this runs again, refreshing the token's TTL.
-        token = secrets.token_urlsafe(16)
-        await request.app.state.redis.set(
-            _nzb_token_key(token),
-            json.dumps({"indexer": name, "url": upstream_url}),
-            ex=_NZB_TOKEN_TTL,
-        )
+        # The token deterministically encrypts the original upstream guid; the
+        # upstream URL (which may embed an indexer key) is rebuilt at download
+        # time and nothing is stored. A cache-hit re-render therefore produces
+        # the exact same token rather than growing Redis with a fresh key.
+        token = sign(request.app.state.settings.nzb_token_signing_key, name, item.guid)
         guid = compose_guid(name, token)
         download_url = _download_url(request, guid)
         # nzbhydra2 advertises its own download link as both the item link and
@@ -652,13 +648,25 @@ async def _handle_getnzb(request: Request) -> Response:
         # are upstream URLs (possibly carrying an indexer key). Fetch directly.
         upstream_url = token
     else:
-        # Resolve the opaque token to the upstream URL stored at search time.
-        stored = _decode_nzb_token(await app.state.redis.get(_nzb_token_key(token)))
-        if stored is None or stored.get("indexer") != indexer_name:
-            raise NewznabError(300, "No such item (download token expired or unknown)")
-        upstream_url = stored.get("url")
-        if not isinstance(upstream_url, str) or not upstream_url:
-            raise NewznabError(300, "No such item (download token expired or unknown)")
+        # New deterministic token: verify it for the indexer recovered from the
+        # composed guid and rebuild the upstream URL from the recovered guid. A
+        # token signed for a different indexer fails the HMAC tag, so it falls
+        # through to the legacy stored-token lookup below.
+        original_guid = verify(
+            request.app.state.settings.nzb_token_signing_key, indexer_name, token
+        )
+        if original_guid is not None:
+            owner = app.state.indexers[indexer_name]
+            upstream_url = _derive_download_url(owner, client, original_guid)
+        else:
+            # Legacy: resolve the opaque token to the upstream URL stored at
+            # search time by v0.4.5-era renders, until its TTL expires.
+            stored = _decode_nzb_token(await app.state.redis.get(_nzb_token_key(token)))
+            if stored is None or stored.get("indexer") != indexer_name:
+                raise NewznabError(300, "No such item (download token expired or unknown)")
+            upstream_url = stored.get("url")
+            if not isinstance(upstream_url, str) or not upstream_url:
+                raise NewznabError(300, "No such item (download token expired or unknown)")
 
     allowed = await app.state.limits.consume(indexer_name, LimitKind.NZB)
     await _update_limit_gauge(request, indexer_name, LimitKind.NZB)

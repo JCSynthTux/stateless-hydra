@@ -122,6 +122,7 @@ def settings(test_dir) -> AppSettings:
         dedupe_by_title=False,
         max_results_per_indexer=10,
         log_level="CRITICAL",
+        nzb_token_signing_key="test-signing-key-0123456789abcdef",
     )
 
 
