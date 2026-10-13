@@ -68,7 +68,7 @@ jobs:
       # result into the local image store, proving it builds without
       # publishing anything to a registry.
       - name: Build image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: false
