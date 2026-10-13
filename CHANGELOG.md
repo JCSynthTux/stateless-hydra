@@ -1,6 +1,24 @@
 # CHANGELOG
 
 
+## v0.5.1 (2026-10-13)
+
+### Bug Fixes
+
+- **config**: Source NZB signing key from api-keys secret file
+  ([`ce2c7c8`](https://github.com/JCSynthTux/stateless-hydra/commit/ce2c7c86aad0a20ce31607d6d89eba17cacf67d5))
+
+### Chores
+
+- **ops**: Move signing key into api-keys secret file
+  ([`572fbd2`](https://github.com/JCSynthTux/stateless-hydra/commit/572fbd2c2b1297e7a5745028ff7662d55018616d))
+
+### Documentation
+
+- **readme**: Document api-keys signing key sourcing
+  ([`6a8dac9`](https://github.com/JCSynthTux/stateless-hydra/commit/6a8dac9c1ce9edec8c205cc07b3a867a1abeb8aa))
+
+
 ## v0.5.0 (2026-10-13)
 
 ### Documentation
