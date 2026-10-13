@@ -29,6 +29,7 @@ from .config import (
     load_indexers,
     load_settings,
     resolve_indexer_key,
+    resolve_nzb_token_signing_key,
     setup_logging,
 )
 from .exceptions import ConfigError
@@ -59,6 +60,13 @@ def create_app(
 
     indexer_list = load_indexers(settings.indexers_file)
     api_keys = load_api_keys(settings.api_keys_file)
+    # Resolve the signing key here, not in load_settings: an injected settings
+    # object (tests) skips load_settings, and the api-keys file (the primary
+    # source) is only read at this point. An app.yaml/environment value wins;
+    # otherwise the api-keys.yaml nzbTokenSigningKey is used.
+    settings.nzb_token_signing_key = resolve_nzb_token_signing_key(
+        settings.nzb_token_signing_key, api_keys.nzb_token_signing_key
+    )
     if not api_keys.hydra_api_keys:
         raise ConfigError("at least one hydraApiKeys entry is required (client API keys)")
 

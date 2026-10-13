@@ -107,6 +107,11 @@ class ApiKeysFile(BaseModel):
 
     api_keys: dict[str, str] = Field(default_factory=dict, alias="apiKeys")  # refs -> keys
     hydra_api_keys: list[str] = Field(default_factory=list, alias="hydraApiKeys")  # client keys
+    # HMAC key material for NZB download tokens, carried inside the same secret
+    # file so a Kubernetes Secret can ship both the indexer keys and the signing
+    # key in one mounted volume. An app.yaml value or SH_NZB_TOKEN_SIGNING_KEY
+    # environment variable overrides it (see resolve_nzb_token_signing_key).
+    nzb_token_signing_key: str | None = Field(default=None, alias="nzbTokenSigningKey")
 
 
 class AppSettings(BaseSettings):
@@ -126,11 +131,12 @@ class AppSettings(BaseSettings):
     app_config: str = _DEFAULT_APP_CONFIG
     indexers_file: str = "/config/indexers.yaml"
     api_keys_file: str = "/config/api-keys.yaml"
-    # Secret (SH_NZB_TOKEN_SIGNING_KEY) used to sign deterministic NZB download
-    # tokens. Required: without it every request would mint unsigned tokens.
-    # Validation is a model-level check so it runs whether the key arrives via
-    # ``SH_NZB_TOKEN_SIGNING_KEY`` or the YAML app config -- and still fails
-    # fast at load time when neither provides one.
+    # Override for the secret HMAC key used to sign deterministic NZB download
+    # tokens. It is optional: when empty the ``nzbTokenSigningKey`` field of the
+    # api-keys.yaml secret file is used instead (the primary source in the
+    # shipped Kubernetes manifests). ``resolve_nzb_token_signing_key`` applies
+    # the final precedence (this value > api-keys file > fail fast) once the
+    # api-keys file has been read in ``create_app``.
     nzb_token_signing_key: str = ""
 
     @field_validator("nzb_token_signing_key")
@@ -142,12 +148,17 @@ class AppSettings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_nzb_token_signing_key(self) -> AppSettings:
-        if len(self.nzb_token_signing_key) < _MIN_SIGNING_KEY_LENGTH:
+        # An empty value is allowed here: the api-keys.yaml file (the primary
+        # source) has not been read yet, and create_app resolves the effective
+        # key from both sources. Only a *provided but too short* value is
+        # rejected immediately, so a truncated override fails fast at load time.
+        if 0 < len(self.nzb_token_signing_key) < _MIN_SIGNING_KEY_LENGTH:
             raise ValueError(
                 "nzb_token_signing_key must be at least "
-                f"{_MIN_SIGNING_KEY_LENGTH} characters; set it via the "
-                "SH_NZB_TOKEN_SIGNING_KEY environment variable sourced from a "
-                "Kubernetes Secret (never a plaintext ConfigMap/app.yaml value)"
+                f"{_MIN_SIGNING_KEY_LENGTH} characters; set the "
+                "nzbTokenSigningKey field in the api-keys.yaml secret file, or "
+                "override it with the SH_NZB_TOKEN_SIGNING_KEY environment "
+                "variable"
             )
         return self
 
@@ -191,10 +202,12 @@ def load_settings(app_config: str | None = None) -> AppSettings:
 
     The resolved YAML mapping and the explicitly-set ``SH_*`` environment
     variables are merged (environment values override YAML), then validated
-    exactly once by constructing :class:`AppSettings`. Deferring validation
-    until after the merge means a signing key supplied only in the YAML file is
-    accepted, while an environment-only key also works and neither supplied
-    fails fast with :class:`~stateless_hydra.exceptions.ConfigError`.
+    exactly once by constructing :class:`AppSettings`. A signing key supplied
+    only in the YAML file is accepted, as is an environment-only key. The final
+    check -- including falling back to the ``nzbTokenSigningKey`` field of the
+    api-keys.yaml secret file and failing fast when no source provides a key --
+    happens in ``create_app`` via :func:`resolve_nzb_token_signing_key` once that
+    file has been read.
     """
     if app_config is not None:
         path = Path(app_config)
@@ -244,6 +257,32 @@ def load_api_keys(path: str) -> ApiKeysFile:
         return ApiKeysFile.model_validate(data)
     except ValidationError as exc:
         raise ConfigError(f"invalid API keys file {path}: {exc}") from exc
+
+
+def resolve_nzb_token_signing_key(settings_key: str, api_keys_key: str | None) -> str:
+    """Resolve the NZB token signing key from its two possible sources.
+
+    Precedence: an explicitly configured ``settings_key`` (the
+    ``nzb_token_signing_key`` value from app.yaml or the
+    ``SH_NZB_TOKEN_SIGNING_KEY`` environment variable) wins; when it is empty
+    the ``nzbTokenSigningKey`` field of the api-keys.yaml secret file is used.
+    Both values are stripped before the length check so leading/trailing
+    whitespace never counts as key material. Fails fast with
+    :class:`~stateless_hydra.exceptions.ConfigError` naming both sources when
+    neither provides at least ``_MIN_SIGNING_KEY_LENGTH`` characters.
+    """
+    explicit = settings_key.strip()
+    from_api_keys = (api_keys_key or "").strip()
+    effective = explicit or from_api_keys
+    if len(effective) < _MIN_SIGNING_KEY_LENGTH:
+        raise ConfigError(
+            "NZB token signing key is missing or shorter than "
+            f"{_MIN_SIGNING_KEY_LENGTH} characters; set the nzbTokenSigningKey "
+            "field in the api-keys.yaml secret file (e.g. "
+            "k8s/secret-api-keys.yaml, mounted at /config/api-keys.yaml), or "
+            "override it with the SH_NZB_TOKEN_SIGNING_KEY environment variable"
+        )
+    return effective
 
 
 def resolve_indexer_key(indexer: IndexerConfig, api_keys: ApiKeysFile) -> str:

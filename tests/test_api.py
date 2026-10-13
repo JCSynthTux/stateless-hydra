@@ -1648,3 +1648,54 @@ def test_empty_hydra_api_keys_raises_config_error(tmp_path):
 
     with pytest.raises(ConfigError):
         create_app(settings, redis_client=aioredis.FakeRedis())
+
+
+@respx.mock
+def test_app_boots_with_signing_key_from_api_keys_file(tmp_path, fake_redis):
+    # The signing key may live inside the mounted api-keys.yaml secret
+    # (the nzbTokenSigningKey field) with no SH_NZB_TOKEN_SIGNING_KEY env var:
+    # create_app resolves it at startup and a search render + getnzb round-trip
+    # works end to end.
+    (tmp_path / "indexers.yaml").write_text(
+        "indexers:\n"
+        "  - name: filekey\n"
+        "    host: https://filekey.example.com\n"
+        "    apiPath: /api\n"
+        "    apiKeyRef: fk_key\n",
+        encoding="utf-8",
+    )
+    file_key = "api-keys-file-signing-key-0123456789abcdef"
+    (tmp_path / "api-keys.yaml").write_text(
+        "apiKeys:\n  fk_key: fk-secret\n"
+        "hydraApiKeys:\n  - test-key\n"
+        f'nzbTokenSigningKey: "{file_key}"\n',
+        encoding="utf-8",
+    )
+    settings = AppSettings(
+        indexers_file=str(tmp_path / "indexers.yaml"),
+        api_keys_file=str(tmp_path / "api-keys.yaml"),
+        log_level="CRITICAL",
+    )
+    filekey_app = create_app(settings, redis_client=fake_redis)
+    assert filekey_app.state.settings.nzb_token_signing_key == file_key
+
+    base = "https://filekey.example.com/api"
+    respx.get(base, params={"t": "search"}).mock(
+        return_value=httpx.Response(200, text=_single_item_rss("guid-one"))
+    )
+    upstream = respx.get(base, params={"t": "getnzb", "id": "guid-one"}).mock(
+        return_value=httpx.Response(200, content=b"file-key-nzb")
+    )
+
+    with TestClient(filekey_app) as filekey_client:
+        search = filekey_client.get(
+            API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "filekey"}
+        )
+        assert search.status_code == 200
+        assert _guids(search.text)[0].startswith("filekey:")
+        download = _follow_enclosure(filekey_client, search.text)
+
+    assert download.status_code == 200
+    assert download.content == b"file-key-nzb"
+    assert download.headers["content-type"] == "application/x-nzb"
+    assert upstream.call_count == 1

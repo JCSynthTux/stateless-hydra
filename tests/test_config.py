@@ -7,6 +7,7 @@ files under ``config/`` (which a later task owns).
 import logging
 
 import pytest
+from fakeredis import aioredis
 
 from stateless_hydra.config import (
     AppSettings,
@@ -15,9 +16,11 @@ from stateless_hydra.config import (
     load_indexers,
     load_settings,
     resolve_indexer_key,
+    resolve_nzb_token_signing_key,
     setup_logging,
 )
 from stateless_hydra.exceptions import ConfigError
+from stateless_hydra.main import create_app
 
 FULL_INDEXERS_YAML = """
 indexers:
@@ -92,13 +95,16 @@ EMPTY_INDEXERS_YAML = """
 indexers: []
 """
 
-API_KEYS_YAML = """
+_FILE_SIGNING_KEY = "api-keys-file-signing-key-0123456789abcdef"
+
+API_KEYS_YAML = f"""
 apiKeys:
   nzbgeek: secret-key-123
   minimal: minimal-secret
 hydraApiKeys:
   - client-key-1
   - client-key-2
+nzbTokenSigningKey: "{_FILE_SIGNING_KEY}"
 """
 
 
@@ -284,11 +290,50 @@ def test_api_keys_file_with_hydra_keys_loads(tmp_path):
 
     assert api_keys.api_keys == {"nzbgeek": "secret-key-123", "minimal": "minimal-secret"}
     assert api_keys.hydra_api_keys == ["client-key-1", "client-key-2"]
+    assert api_keys.nzb_token_signing_key == _FILE_SIGNING_KEY
 
 
 def test_missing_api_keys_file_raises_config_error(tmp_path):
     with pytest.raises(ConfigError):
         load_api_keys(str(tmp_path / "missing-api-keys.yaml"))
+
+
+# --- NZB signing key resolution ---------------------------------------------
+
+
+def test_resolve_uses_api_keys_file_key_when_settings_empty(tmp_path):
+    api_keys = load_api_keys(_write(tmp_path, "api-keys.yaml", API_KEYS_YAML))
+
+    resolved = resolve_nzb_token_signing_key("", api_keys.nzb_token_signing_key)
+
+    assert resolved == _FILE_SIGNING_KEY
+
+
+def test_resolve_prefers_settings_key_over_api_keys_file(tmp_path):
+    api_keys = load_api_keys(_write(tmp_path, "api-keys.yaml", API_KEYS_YAML))
+    settings_key = "settings-override-signing-key-0123456789"
+
+    resolved = resolve_nzb_token_signing_key(settings_key, api_keys.nzb_token_signing_key)
+
+    assert resolved == settings_key
+
+
+def test_resolve_strips_both_sources(tmp_path):
+    api_keys = load_api_keys(_write(tmp_path, "api-keys.yaml", API_KEYS_YAML))
+
+    resolved = resolve_nzb_token_signing_key("   ", f"  {api_keys.nzb_token_signing_key}  ")
+
+    assert resolved == _FILE_SIGNING_KEY
+
+
+def test_resolve_missing_in_both_sources_raises_config_error():
+    with pytest.raises(ConfigError):
+        resolve_nzb_token_signing_key("", None)
+
+
+def test_resolve_short_api_keys_file_key_raises_config_error():
+    with pytest.raises(ConfigError):
+        resolve_nzb_token_signing_key("", "too-short")
 
 
 _TEST_SIGNING_KEY = "unit-test-signing-key-0123456789abcdef"
@@ -297,8 +342,9 @@ _TEST_SIGNING_KEY = "unit-test-signing-key-0123456789abcdef"
 def _clear_sh_env(monkeypatch):
     for field_name in AppSettings.model_fields:
         monkeypatch.delenv(f"SH_{field_name.upper()}", raising=False)
-    # ``nzb_token_signing_key`` is required; give tests a valid value so only
-    # the setting under test controls the outcome.
+    # ``nzb_token_signing_key`` may come from the api-keys file; give tests a
+    # valid settings-level value so only the setting under test controls the
+    # outcome.
     monkeypatch.setenv("SH_NZB_TOKEN_SIGNING_KEY", _TEST_SIGNING_KEY)
 
 
@@ -318,20 +364,53 @@ def test_settings_defaults_when_nothing_set(tmp_path, monkeypatch):
     assert settings.nzb_token_signing_key == _TEST_SIGNING_KEY
 
 
-def test_missing_nzb_token_signing_key_raises_config_error(tmp_path, monkeypatch):
+def test_missing_nzb_token_signing_key_loads_then_resolve_raises(tmp_path, monkeypatch):
+    # load_settings no longer fails when no signing key is set: the final check
+    # is deferred to resolve_nzb_token_signing_key (called from create_app)
+    # because the api-keys.yaml file, the primary source, is read there.
     for field_name in AppSettings.model_fields:
         monkeypatch.delenv(f"SH_{field_name.upper()}", raising=False)
 
+    settings = load_settings(str(tmp_path / "missing-app.yaml"))
+
+    assert settings.nzb_token_signing_key == ""
     with pytest.raises(ConfigError):
-        load_settings(str(tmp_path / "missing-app.yaml"))
+        resolve_nzb_token_signing_key(settings.nzb_token_signing_key, None)
 
 
-def test_empty_nzb_token_signing_key_raises_config_error(tmp_path, monkeypatch):
+def test_empty_nzb_token_signing_key_loads_then_resolve_raises(tmp_path, monkeypatch):
     _clear_sh_env(monkeypatch)
     monkeypatch.setenv("SH_NZB_TOKEN_SIGNING_KEY", "   ")
 
+    settings = load_settings(str(tmp_path / "missing-app.yaml"))
+
+    # An all-whitespace value strips to empty and is not itself a short key.
+    assert settings.nzb_token_signing_key == ""
     with pytest.raises(ConfigError):
-        load_settings(str(tmp_path / "missing-app.yaml"))
+        resolve_nzb_token_signing_key(settings.nzb_token_signing_key, None)
+
+
+def test_create_app_without_any_signing_key_raises_config_error(tmp_path, monkeypatch):
+    # Startup with neither a settings override nor a nzbTokenSigningKey field in
+    # the api-keys file must fail fast with a clear ConfigError.
+    for field_name in AppSettings.model_fields:
+        monkeypatch.delenv(f"SH_{field_name.upper()}", raising=False)
+    (tmp_path / "indexers.yaml").write_text(
+        "indexers:\n  - name: ix\n    host: https://ix.example.com\n    apiKeyRef: anything\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "api-keys.yaml").write_text(
+        "apiKeys:\n  anything: value\nhydraApiKeys:\n  - test-key\n",
+        encoding="utf-8",
+    )
+    settings = AppSettings(
+        indexers_file=str(tmp_path / "indexers.yaml"),
+        api_keys_file=str(tmp_path / "api-keys.yaml"),
+        log_level="CRITICAL",
+    )
+
+    with pytest.raises(ConfigError):
+        create_app(settings, redis_client=aioredis.FakeRedis())
 
 
 def test_short_nzb_token_signing_key_raises_config_error(tmp_path, monkeypatch):
