@@ -70,16 +70,17 @@ The repo ships `docker-compose.yml` plus example config in `config/`.
    $EDITOR config/indexers.yaml   # add your indexers
    $EDITOR config/api-keys.yaml   # add real indexer keys + a hydra API key
    ```
-2. Generate the NZB token signing key and export it in the shell that runs
-   Compose (a random secret of at least 32 characters):
+   Then generate the NZB token signing key and paste it over the
+   `nzbTokenSigningKey` placeholder in `config/api-keys.yaml` (a random secret
+   of at least 32 characters):
    ```sh
-   export SH_NZB_TOKEN_SIGNING_KEY=$(openssl rand -hex 32)
+   openssl rand -hex 32
    ```
-3. Start the stack:
+2. Start the stack:
    ```sh
    docker compose up --build
    ```
-4. Verify:
+3. Verify:
    ```sh
    curl -s "http://localhost:5076/healthz"
    curl -s "http://localhost:5076/api?t=caps&apikey=YOUR_HYDRA_API_KEY"
@@ -90,11 +91,12 @@ The `app` service mounts `./config` read-only at `/config` and talks to the
 counters). Point Sonarr/Radarr at `http://localhost:5076/api` with one of the
 `hydraApiKeys` values as the API key.
 
-The app requires `SH_NZB_TOKEN_SIGNING_KEY` (a random secret of at least 32
-characters) to sign download tokens; step 2 exports it. `docker-compose.yml`
-declares it with `${SH_NZB_TOKEN_SIGNING_KEY:?...}`, so `docker compose up`
-fails fast with a clear message if it is unset — keep the export in the same
-shell, and reuse the same key across restarts and replicas.
+The app requires an NZB token signing key (a random secret of at least 32
+characters) to sign download tokens; it reads it from the `nzbTokenSigningKey`
+field of the mounted `config/api-keys.yaml`. `docker-compose.yml` therefore
+injects no signing-key environment variable — Compose users edit that file.
+Setting `SH_NZB_TOKEN_SIGNING_KEY` in the environment overrides the file value.
+Reuse the same key across restarts and replicas.
 
 ## Kubernetes quickstart
 
@@ -107,10 +109,11 @@ kubectl apply -k k8s/
 Before doing so:
 
 1. Replace the placeholder values in `k8s/secret-api-keys.yaml` — the indexer
-   keys, the hydra client keys, and `nzbTokenSigningKey` (a random ≥32-character
-   secret for signing download tokens; generate one with `openssl rand -hex 32`)
-   — or, better, manage that Secret with External Secrets, SOPS/sealed-secrets,
-   or a cloud secret manager. **Never commit real keys.**
+   keys and the hydra client keys, and `nzbTokenSigningKey` (a random
+   ≥32-character secret for signing download tokens, a field inside the
+   secret's `api-keys.yaml`; generate one with `openssl rand -hex 32`) — or,
+   better, manage that Secret with External Secrets, SOPS/sealed-secrets, or a
+   cloud secret manager. **Never commit real keys.**
 2. Replace the example indexers in `k8s/configmap-indexers.yaml`.
 3. Point Redis at your own endpoint by editing `redis_url` in
    `k8s/configmap-app.yaml` (the Service name in `k8s/redis.yaml` by default).
@@ -119,11 +122,13 @@ Before doing so:
    override the ConfigMap.
 
 The Deployment mounts the three config files as read-only sub-paths at
-`/config/app.yaml`, `/config/indexers.yaml` and `/config/api-keys.yaml`, injects
-`SH_NZB_TOKEN_SIGNING_KEY` from the `stateless-hydra-api-keys` Secret (key
-`nzbTokenSigningKey`), runs as non-root with a read-only root filesystem (an
-`emptyDir` is mounted at `/tmp`), and exposes `livenessProbe`/`startupProbe` on
-`/healthz` and `readinessProbe` on `/readyz`.
+`/config/app.yaml`, `/config/indexers.yaml` and `/config/api-keys.yaml`. The NZB
+token signing key arrives inside the mounted `api-keys.yaml` (the
+`nzbTokenSigningKey` field of the `stateless-hydra-api-keys` Secret), so no
+`SH_*` secret environment variables are set on the Deployment. It runs as
+non-root with a read-only root filesystem (an `emptyDir` is mounted at `/tmp`),
+and exposes `livenessProbe`/`startupProbe` on `/healthz` and `readinessProbe` on
+`/readyz`.
 
 ### Troubleshooting: `/readyz` returns 503
 
@@ -142,8 +147,9 @@ can be overridden with `SH_APP_CONFIG`, `SH_INDEXERS_FILE` and
 
 ### `app.yaml` — application settings
 
-Every key is optional except `nzb_token_signing_key`, which is **required**;
-defaults are shown. Environment variables (`SH_*`) override file values.
+Every key is optional; defaults are shown. Environment variables (`SH_*`)
+override file values. The signing key is normally read from `api-keys.yaml`;
+a value here (or `SH_NZB_TOKEN_SIGNING_KEY`) is an optional **override**.
 
 | Key | Default | Env var | Description |
 | --- | --- | --- | --- |
@@ -159,14 +165,17 @@ defaults are shown. Environment variables (`SH_*`) override file values.
 | `app_config` | `/config/app.yaml` | `SH_APP_CONFIG` | Path to this file. |
 | `indexers_file` | `/config/indexers.yaml` | `SH_INDEXERS_FILE` | Path to the indexers file. |
 | `api_keys_file` | `/config/api-keys.yaml` | `SH_API_KEYS_FILE` | Path to the secrets file. |
-| `nzb_token_signing_key` | *(required, ≥32 chars)* | `SH_NZB_TOKEN_SIGNING_KEY` | Secret HMAC key that signs NZB download tokens. Must come from a Secret, never this file. See [NZB download resolution](#nzb-download-resolution). |
+| `nzb_token_signing_key` | *(unset)* | `SH_NZB_TOKEN_SIGNING_KEY` | Optional **override** for the HMAC key that signs NZB download tokens. When unset, the `nzbTokenSigningKey` field of `api-keys.yaml` is used; the app refuses to start if neither provides ≥32 characters. See [NZB download resolution](#nzb-download-resolution). |
 
-`nzb_token_signing_key` is the one required setting. Supply it through
-`SH_NZB_TOKEN_SIGNING_KEY` sourced from a Kubernetes Secret (the shipped
-manifests use `stateless-hydra-api-keys` → `nzbTokenSigningKey`); it must **not**
-be committed in `app.yaml`, which ships as a non-secret ConfigMap. All replicas
-must share the same key, and rotating it invalidates every outstanding download
-token.
+An NZB token signing key of at least 32 characters is required, resolved with
+this precedence: `nzb_token_signing_key` in this file or
+`SH_NZB_TOKEN_SIGNING_KEY` (override) → the `nzbTokenSigningKey` field of the
+mounted `api-keys.yaml` secret file → fail fast with a clear error. The shipped
+Kubernetes manifests keep the key inside the `stateless-hydra-api-keys` Secret's
+`api-keys.yaml` (see [api-keys.yaml](#api-keysyaml--secrets)). `app.yaml` ships
+as a non-secret ConfigMap, so prefer the secret file or the environment over
+committing a real key here. All replicas must share the same key, and rotating
+it invalidates every outstanding download token.
 
 Proxy URLs are passed straight to httpx, which supports `http://`, `https://`,
 `socks5://` and `socks5h://`. SOCKS support is compiled into the image via the
@@ -211,11 +220,13 @@ limit of `0` means unlimited but usage is still counted for metrics.
 | --- | --- | --- |
 | `apiKeys` | `{ref: "real-key"}` | Maps each indexer's `apiKeyRef` to its real API key. |
 | `hydraApiKeys` | `["key", ...]` | API keys clients present to `/api`. Must contain at least one entry (the app refuses to start otherwise). |
+| `nzbTokenSigningKey` | `"≥32-char secret"` | HMAC key that signs NZB download tokens. Required unless overridden by `nzb_token_signing_key`/`SH_NZB_TOKEN_SIGNING_KEY`; the app fails fast at startup if no source provides ≥32 characters. |
 
-In Kubernetes the same Secret (`stateless-hydra-api-keys`) also carries the
-`nzbTokenSigningKey` entry, injected into the pod as `SH_NZB_TOKEN_SIGNING_KEY`
-(see [NZB download resolution](#nzb-download-resolution)). It is a Secret value
-of its own, not part of the mounted `api-keys.yaml` file.
+In Kubernetes this Secret (`stateless-hydra-api-keys`) carries
+`nzbTokenSigningKey` as a field **inside** the mounted `api-keys.yaml`, so no
+separate environment variable is needed (see [NZB download
+resolution](#nzb-download-resolution)). Setting `SH_NZB_TOKEN_SIGNING_KEY` in
+the environment overrides the file value.
 
 ## How limits work
 
@@ -255,7 +266,7 @@ guid:
   `t=<downloadFunction>&id=<guid>` against the indexer's API.
 
 The token is derived per `(indexer, original guid)` with an HMAC-based
-encrypt-then-MAC construction keyed by `SH_NZB_TOKEN_SIGNING_KEY`, and is bound
+encrypt-then-MAC construction keyed by the signing key (below), and is bound
 to a rolling daily time bucket. `t=getnzb` verifies the token against the
 indexer named in the composed guid and rebuilds the upstream URL from the
 recovered guid — no lookup and no shared state. A token is accepted for the
@@ -263,12 +274,14 @@ recovered guid — no lookup and no shared state. A token is accepted for the
 before the daily rollover keeps working for a full day. Missing, malformed,
 expired or wrong-indexer tokens return Newznab error `300`.
 
-**Signing key.** `SH_NZB_TOKEN_SIGNING_KEY` is required (at least 32
-characters; the app refuses to start without it) and must be supplied from a
-Kubernetes Secret (`stateless-hydra-api-keys` → `nzbTokenSigningKey` in the
-shipped manifests), never from `app.yaml` or a ConfigMap. All replicas must
-share the same key, so any replica can serve any token. Rotating the key
-invalidates every outstanding token — clients must re-run their search.
+**Signing key.** At least 32 characters, resolved in this precedence order:
+`SH_NZB_TOKEN_SIGNING_KEY` (or `nzb_token_signing_key` in `app.yaml`) as an
+override, then the `nzbTokenSigningKey` field of the mounted `api-keys.yaml`
+secret file. The app refuses to start if neither source provides one. In the
+shipped manifests the key lives inside the `stateless-hydra-api-keys` Secret's
+`api-keys.yaml`, never in `app.yaml` or a ConfigMap. All replicas must share the
+same key, so any replica can serve any token. Rotating the key invalidates every
+outstanding token — clients must re-run their search.
 
 **Grab counting.** Every NZB fetched from an indexer consumes one unit of that
 indexer's daily `nzbPullLimit`, and repeated grabs of the same token each count
