@@ -1,6 +1,22 @@
 # CHANGELOG
 
 
+## v0.5.0 (2026-10-13)
+
+### Documentation
+
+- **readme**: Document NZB token semantics and signing key
+  ([`696549d`](https://github.com/JCSynthTux/stateless-hydra/commit/696549d82b742c60fa4c87c662386a82ff08a7c9))
+
+### Features
+
+- **api**: Deterministic encrypted NZB download tokens
+  ([`66433fb`](https://github.com/JCSynthTux/stateless-hydra/commit/66433fbfec1360cc5394cf78773ebf4700eb2f1b))
+
+- **k8s**: Inject NZB token signing key from secret
+  ([`af174b9`](https://github.com/JCSynthTux/stateless-hydra/commit/af174b9d08c59f55b91f7d2692eb02f05c413a02))
+
+
 ## v0.4.5 (2026-10-11)
 
 ### Bug Fixes
