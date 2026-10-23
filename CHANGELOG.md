@@ -1,6 +1,37 @@
 # CHANGELOG
 
 
+## v0.5.2 (2026-10-23)
+
+### Bug Fixes
+
+- **security**: Remediate confirmed audit findings
+  ([`a0183d3`](https://github.com/JCSynthTux/stateless-hydra/commit/a0183d3d2a6be231362264c3e9580ef1c7ba7c11))
+
+### Build System
+
+- **deps**: Bump actions/checkout from 4 to 7
+  ([`ddd14b8`](https://github.com/JCSynthTux/stateless-hydra/commit/ddd14b88f3b438550c1f23266bf15589754163fb))
+
+Bumps [actions/checkout](https://github.com/actions/checkout) from 4 to 7. - [Release
+  notes](https://github.com/actions/checkout/releases) -
+  [Changelog](https://github.com/actions/checkout/blob/main/CHANGELOG.md) -
+  [Commits](https://github.com/actions/checkout/compare/v4...v7)
+
+--- updated-dependencies: - dependency-name: actions/checkout dependency-version: '7'
+
+dependency-type: direct:production
+
+update-type: version-update:semver-major ...
+
+Signed-off-by: dependabot[bot] <support@github.com>
+
+### Documentation
+
+- **readme**: Replace architecture diagram with mermaid
+  ([`c069141`](https://github.com/JCSynthTux/stateless-hydra/commit/c06914158956bdb9524627151842c7cc0e914b5c))
+
+
 ## v0.5.1 (2026-10-13)
 
 ### Bug Fixes
