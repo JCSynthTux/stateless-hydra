@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## v0.5.3 (2026-10-23)
+
+### Bug Fixes
+
+- **security**: Remediate confirmed audit findings
+  ([`19dc436`](https://github.com/JCSynthTux/stateless-hydra/commit/19dc436b233bb2d6526f16100d3bfdfdb4efee7d))
+
+
 ## v0.5.2 (2026-10-23)
 
 ### Bug Fixes
