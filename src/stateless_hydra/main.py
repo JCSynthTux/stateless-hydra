@@ -77,7 +77,8 @@ def create_app(
             resolve_indexer_key(indexer, api_keys),
             settings.user_agent,
             settings.global_proxy_url,
-            settings.max_upstream_body_bytes,
+            # IndexerClient keeps its byte-level API; the config surface is MiB.
+            settings.max_upstream_body_mib * 1024 * 1024,
         )
         for indexer in indexer_list
     }

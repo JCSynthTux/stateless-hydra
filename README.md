@@ -171,7 +171,7 @@ a value here (or `SH_NZB_TOKEN_SIGNING_KEY`) is an optional **override**.
 | `cache_ttl_seconds` | `900` | `SH_CACHE_TTL_SECONDS` | Default search cache TTL; `0` disables caching. |
 | `dedupe_by_title` | `false` | `SH_DEDUPE_BY_TITLE` | Collapse identical titles across indexers. |
 | `max_results_per_indexer` | `100` | `SH_MAX_RESULTS_PER_INDEXER` | Max results requested per indexer. Must be `1`–`1000` (the feed parser's per-page cap); a higher value is rejected at startup. |
-| `max_upstream_body_bytes` | `16777216` (16 MiB) | `SH_MAX_UPSTREAM_BODY_BYTES` | Hard ceiling on bytes buffered from any single upstream response (searches, details and NZB payloads, including every redirect hop). Must be `> 0`. A larger response is abandoned: on a search the indexer is skipped; on details/getnzb it becomes Newznab error `900` (`Unknown error`). |
+| `max_upstream_body_mib` | `16` (MiB) | `SH_MAX_UPSTREAM_BODY_MIB` | Hard ceiling, in MiB, on the body buffered from any single upstream response (searches, details and NZB payloads, including every redirect hop). Must be `> 0`. A larger response is abandoned: on a search the indexer is skipped; on details/getnzb it becomes Newznab error `900` (`Unknown error`). |
 | `per_client_api_hit_limit` | `0` | `SH_PER_CLIENT_API_HIT_LIMIT` | Daily per-client cap on indexer API hits, on top of the per-indexer budgets. `0` = unlimited. Must be `>= 0`. Counted per UTC day and keyed by a SHA-256 hash of the client's API key. When a client exhausts it, its searches skip every indexer (`910` when nothing else answers) without spending the indexer budget. See [How limits work](#how-limits-work). |
 | `per_client_nzb_pull_limit` | `0` | `SH_PER_CLIENT_NZB_PULL_LIMIT` | Daily per-client cap on NZB pulls, on top of the per-indexer budgets. `0` = unlimited. Must be `>= 0`. Exhausting it makes the client's `getnzb` return `930` without spending the indexer's pull budget. See [How limits work](#how-limits-work). |
 | `global_proxy_url` | unset | `SH_GLOBAL_PROXY_URL` | Default proxy for indexer requests: `http://`, `https://`, `socks5://` (or `socks5h://`). |
@@ -318,7 +318,7 @@ directly. Redirects during a download (and during a `t=details` fetch) are
 re-validated **per hop** against that pinned origin, so a hostile or
 compromised upstream cannot bounce the proxy onto another host; a cross-origin
 hop is refused and the request becomes Newznab error `900` (Unknown error).
-Each hop's body is also capped by `max_upstream_body_bytes`.
+Each hop's body is also capped by `max_upstream_body_mib`.
 
 **Advertised download links.** Every result's `<link>` and `<enclosure>` point
 back at this proxy's own `/api?t=get&id=…` URL. By default that URL is built
@@ -408,7 +408,7 @@ of the limits story. Clearing Redis is always safe: it only costs a cold cache
 and a reset of the current day's counters.
 
 Upstream responses are also bounded in memory. Each search/details/NZB fetch
-streams at most `max_upstream_body_bytes` (16 MiB by default, configurable) and
+streams at most `max_upstream_body_mib` (16 MiB by default, configurable) and
 is abandoned with an indexer error if it grows larger; a search feed is
 additionally refused when it exceeds **5 MiB** or contains more than **1000
 items**. Oversized feeds are therefore rejected (the indexer is skipped, or a

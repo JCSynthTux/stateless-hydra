@@ -476,7 +476,7 @@ def test_settings_defaults_when_nothing_set(tmp_path, monkeypatch):
     assert settings.cache_ttl_seconds == 900
     assert settings.dedupe_by_title is False
     assert settings.max_results_per_indexer == 100
-    assert settings.max_upstream_body_bytes == 16 * 1024 * 1024
+    assert settings.max_upstream_body_mib == 16
     assert settings.global_proxy_url is None
     assert settings.host == "0.0.0.0"
     assert settings.port == 5076
@@ -484,12 +484,12 @@ def test_settings_defaults_when_nothing_set(tmp_path, monkeypatch):
     assert settings.nzb_token_signing_key == _TEST_SIGNING_KEY
 
 
-def test_max_upstream_body_bytes_defaults_to_16_mib(tmp_path, monkeypatch):
+def test_max_upstream_body_mib_defaults_to_16_mib(tmp_path, monkeypatch):
     _clear_sh_env(monkeypatch)
 
     settings = load_settings(str(tmp_path / "missing-app.yaml"))
 
-    assert settings.max_upstream_body_bytes == 16 * 1024 * 1024
+    assert settings.max_upstream_body_mib == 16
 
 
 @pytest.mark.parametrize("value", ["0", "-1"])
@@ -519,28 +519,29 @@ def test_max_results_per_indexer_accepts_bounds(tmp_path, monkeypatch, value):
     assert load_settings(path).max_results_per_indexer == value
 
 
-@pytest.mark.parametrize("value", ["0", "-1", "-1048576"])
-def test_max_upstream_body_bytes_must_be_positive(tmp_path, monkeypatch, value):
+@pytest.mark.parametrize("value", ["0", "-1", "-16"])
+def test_max_upstream_body_mib_must_be_positive(tmp_path, monkeypatch, value):
     _clear_sh_env(monkeypatch)
-    path = _write(tmp_path, "app.yaml", f"max_upstream_body_bytes: {value}\n")
+    path = _write(tmp_path, "app.yaml", f"max_upstream_body_mib: {value}\n")
 
-    with pytest.raises(ConfigError, match="max_upstream_body_bytes"):
+    with pytest.raises(ConfigError, match="max_upstream_body_mib"):
         load_settings(path)
 
 
-def test_max_upstream_body_bytes_loads_from_yaml(tmp_path, monkeypatch):
+@pytest.mark.parametrize("value", [1, 8, 512])
+def test_max_upstream_body_mib_loads_from_yaml(tmp_path, monkeypatch, value):
     _clear_sh_env(monkeypatch)
-    path = _write(tmp_path, "app.yaml", "max_upstream_body_bytes: 1048576\n")
+    path = _write(tmp_path, "app.yaml", f"max_upstream_body_mib: {value}\n")
 
-    assert load_settings(path).max_upstream_body_bytes == 1048576
+    assert load_settings(path).max_upstream_body_mib == value
 
 
-def test_max_upstream_body_bytes_env_override_wins(tmp_path, monkeypatch):
+def test_max_upstream_body_mib_env_override_wins(tmp_path, monkeypatch):
     _clear_sh_env(monkeypatch)
-    path = _write(tmp_path, "app.yaml", "max_upstream_body_bytes: 1048576\n")
-    monkeypatch.setenv("SH_MAX_UPSTREAM_BODY_BYTES", "2048")
+    path = _write(tmp_path, "app.yaml", "max_upstream_body_mib: 8\n")
+    monkeypatch.setenv("SH_MAX_UPSTREAM_BODY_MIB", "2")
 
-    assert load_settings(path).max_upstream_body_bytes == 2048
+    assert load_settings(path).max_upstream_body_mib == 2
 
 
 def test_public_base_url_defaults_to_none(tmp_path, monkeypatch):

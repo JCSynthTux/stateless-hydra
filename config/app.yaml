@@ -39,12 +39,12 @@ dedupe_by_title: false
 # env: SH_MAX_RESULTS_PER_INDEXER
 max_results_per_indexer: 100
 
-# Hard ceiling in bytes on a single upstream response (searches, details, NZB
+# Hard ceiling in MiB on a single upstream response (searches, details, NZB
 # payloads, and every redirect hop). Must be > 0. A larger response is
 # abandoned: on a search the indexer is skipped, while details/NZB return
 # Newznab error 900 (Unknown error).
-# env: SH_MAX_UPSTREAM_BODY_BYTES
-# max_upstream_body_bytes: 16777216
+# env: SH_MAX_UPSTREAM_BODY_MIB
+# max_upstream_body_mib: 16
 
 # Per-client daily envelopes over the shared per-indexer budgets. Each value
 # caps how much of an indexer's daily budget one client (identified by a hash

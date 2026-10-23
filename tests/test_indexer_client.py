@@ -115,6 +115,14 @@ async def test_client_without_proxy_has_no_proxy_mount(make_client):
     assert not client.client._mounts
 
 
+def test_default_body_cap_is_16_mib(make_client):
+    # The config surface is MiB (``max_upstream_body_mib``), but this byte-level
+    # boundary still defaults to the equivalent 16 MiB.
+    client = make_client()
+
+    assert client._max_body_bytes == 16 * 1024 * 1024
+
+
 # --- search ------------------------------------------------------------------
 
 

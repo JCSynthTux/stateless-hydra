@@ -22,7 +22,7 @@ from urllib.parse import urlencode, urlsplit
 
 import httpx
 
-from .config import DEFAULT_MAX_UPSTREAM_BODY_BYTES, IndexerConfig
+from .config import DEFAULT_MAX_UPSTREAM_BODY_MIB, IndexerConfig
 from .exceptions import StatelessHydraError
 
 # An ``(scheme, authority)`` pair identifying the one origin a request may reach.
@@ -33,6 +33,10 @@ _MAX_REDIRECT_HOPS = 5
 
 # Ports that are implied by a scheme and therefore omitted when canonicalizing.
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+# Bytes per MiB, for converting the MiB-valued config knob at this byte-level
+# boundary.
+_BYTES_PER_MIB = 1024 * 1024
 
 
 class IndexerError(StatelessHydraError):
@@ -121,7 +125,7 @@ class IndexerClient:
         api_key: str,
         user_agent: str,
         global_proxy_url: str | None = None,
-        max_body_bytes: int = DEFAULT_MAX_UPSTREAM_BODY_BYTES,
+        max_body_bytes: int = DEFAULT_MAX_UPSTREAM_BODY_MIB * _BYTES_PER_MIB,
     ) -> None:
         self._indexer = indexer
         self._api_key = api_key

@@ -29,10 +29,11 @@ data:
     dedupe_by_title: false
     max_results_per_indexer: 100
 
-    # Hard ceiling in bytes on a single upstream response (includes every
+    # Hard ceiling in MiB on a single upstream response (includes every
     # redirect hop). Must be > 0; a larger response is abandoned (a search
     # skips the indexer, details/NZB return Newznab error 900).
-    # max_upstream_body_bytes: 16777216
+    # env: SH_MAX_UPSTREAM_BODY_MIB
+    # max_upstream_body_mib: 16
 
     # Per-client UTC-daily envelopes over the shared per-indexer budgets. 0
     # (default) = unlimited; a refused search answers 910, a download 930.

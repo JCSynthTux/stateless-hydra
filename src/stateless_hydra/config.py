@@ -33,11 +33,11 @@ from .newznab import MAX_FEED_ITEMS
 # material; a short/guessable key would let a client forge download tokens.
 _MIN_SIGNING_KEY_LENGTH = 32
 
-# Default ceiling for an upstream response body. A malicious or broken indexer
-# can stream arbitrarily many bytes; buffering them unbounded would let a few
-# large responses exhaust the pod's 256Mi memory limit. 16 MiB is generous for
-# a Newznab RSS page or an NZB payload while keeping the worst case bounded.
-DEFAULT_MAX_UPSTREAM_BODY_BYTES = 16 * 1024 * 1024
+# Default ceiling for an upstream response body, in MiB. A malicious or broken
+# indexer can stream arbitrarily many bytes; buffering them unbounded would let
+# a few large responses exhaust the pod's 256Mi memory limit. 16 MiB is generous
+# for a Newznab RSS page or an NZB payload while keeping the worst case bounded.
+DEFAULT_MAX_UPSTREAM_BODY_MIB = 16
 
 # Default location of the YAML app configuration. Also the ``app_config`` field
 # default, kept as a module constant so ``load_settings`` can locate the file
@@ -181,9 +181,10 @@ class AppSettings(BaseSettings):
     cache_ttl_seconds: int = 900
     dedupe_by_title: bool = False
     max_results_per_indexer: int = 100
-    # Hard ceiling on bytes buffered from any single upstream response. Applies
-    # to every indexer search/details/NZB fetch (and every redirect hop).
-    max_upstream_body_bytes: int = DEFAULT_MAX_UPSTREAM_BODY_BYTES
+    # Hard ceiling, in MiB, on the body buffered from any single upstream
+    # response. Applies to every indexer search/details/NZB fetch (and every
+    # redirect hop).
+    max_upstream_body_mib: int = DEFAULT_MAX_UPSTREAM_BODY_MIB
     # Per-client daily envelopes over the shared per-indexer budgets. 0 means
     # unlimited (and writes no Redis keys). They reset at UTC midnight and are
     # keyed by a hash of the presented client API key. Without them one
@@ -241,15 +242,15 @@ class AppSettings(BaseSettings):
             )
         return value
 
-    @field_validator("max_upstream_body_bytes")
+    @field_validator("max_upstream_body_mib")
     @classmethod
-    def _validate_max_upstream_body_bytes(cls, value: int) -> int:
+    def _validate_max_upstream_body_mib(cls, value: int) -> int:
         # A non-positive cap would reject every response (or disable the guard
         # entirely, depending on the comparison), so refuse it at startup.
         if value <= 0:
             raise ValueError(
-                "max_upstream_body_bytes must be greater than 0; set it via "
-                "SH_MAX_UPSTREAM_BODY_BYTES or the max_upstream_body_bytes field "
+                "max_upstream_body_mib must be greater than 0; set it via "
+                "SH_MAX_UPSTREAM_BODY_MIB or the max_upstream_body_mib field "
                 "in app.yaml"
             )
         return value

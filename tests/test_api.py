@@ -1063,9 +1063,9 @@ def test_all_indexers_upstream_error_xml_yields_900(client):
 @respx.mock
 def test_oversized_upstream_search_body_is_skipped_not_500(settings, fake_redis):
     """A body over the cap degrades to the normal indexer-failure mapping."""
-    capped_settings = settings.model_copy(update={"max_upstream_body_bytes": 64})
+    capped_settings = settings.model_copy(update={"max_upstream_body_mib": 1})
     capped_app = create_app(capped_settings, redis_client=fake_redis)
-    respx.get(GEEK).mock(return_value=httpx.Response(200, text="<rss>" + "x" * 256))
+    respx.get(GEEK).mock(return_value=httpx.Response(200, text="<rss>" + "x" * (1024 * 1024)))
 
     with TestClient(capped_app) as capped_client:
         response = capped_client.get(
