@@ -5,8 +5,17 @@
 # k8s/secret-api-keys.yaml) mounted read-only at /config/api-keys.yaml.
 # The checked-in copy uses CHANGE_ME placeholders only.
 #
+# The placeholders below are deliberately unusable: startup refuses to boot
+# while any of them is left in place, so a forgotten replacement can never
+# expose a publicly known client API key. The gates run in this order:
+#   1. apiKeys values (and hydraApiKeys entries) that are `CHANGE_ME` or start
+#      with it are rejected as soon as the file is loaded.
+#   2. nzbTokenSigningKey must be >=32 characters, checked after the app.yaml /
+#      SH_NZB_TOKEN_SIGNING_KEY override is applied.
+#   3. hydraApiKeys must contain at least one entry.
+#
 # Prefer a secret manager (External Secrets Operator, SOPS, Sealed Secrets)
-# over hand-editing a manifest; the checked-in manifest is a template.
+# over hand-editing a file; the checked-in copy is a template.
 #
 #   apiKeys       name -> real indexer API key. The name is referenced by the
 #                 `apiKeyRef` field of an indexer in indexers.yaml.
@@ -20,12 +29,16 @@
 #                 SH_NZB_TOKEN_SIGNING_KEY environment variable overrides it.
 # =============================================================================
 
+# Replace both placeholders with your real upstream indexer API keys. The
+# CHANGE_ME values intentionally block startup until they are replaced.
 apiKeys:
   example_indexer_key: "CHANGE_ME"
   example_torznab_key: "CHANGE_ME"
 
-hydraApiKeys:
-  - "CHANGE_ME"
+# At least one real random key is required -- this is the only authentication
+# factor on /api. Generate one with `openssl rand -hex 24`. Intentionally empty
+# so a forgotten replacement refuses to start.
+hydraApiKeys: []
 
 # Replace with `openssl rand -hex 32`. The placeholder below is <32 characters,
 # so a forgotten replacement refuses to start rather than booting with a known key.

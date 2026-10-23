@@ -13,18 +13,26 @@ affect lookups. A non-positive TTL disables caching.
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Sequence
 
 from redis.asyncio import Redis
 
 _KEY_PREFIX = "stateless_hydra:cache"
-_SEPARATOR = "\x1f"
 
 
 def cache_key_for(params_tuple: Sequence[str]) -> str:
-    """Return a stable SHA-256 hex digest for a normalized query term tuple."""
-    joined = _SEPARATOR.join(params_tuple)
-    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+    """Return a stable SHA-256 hex digest for a normalized query term tuple.
+
+    The tuple is serialized with JSON rather than joined with a separator
+    character: a client-controlled value may contain any character, so a plain
+    join lets one value imitate a tuple boundary (a single value containing
+    U+001F serializes identically to two values). JSON quotes and escapes each
+    string, so values can never impersonate tuple boundaries and distinct
+    parameter tuples always produce distinct preimages.
+    """
+    preimage = json.dumps(list(params_tuple), separators=(",", ":"))
+    return hashlib.sha256(preimage.encode("utf-8")).hexdigest()
 
 
 class QueryCache:
@@ -44,12 +52,20 @@ class QueryCache:
         return f"{_KEY_PREFIX}:{indexer}:{key}"
 
     async def get(self, indexer: str, key: str) -> str | None:
-        """Return the cached response text, or ``None`` on a miss."""
+        """Return the cached response text, or ``None`` on a miss.
+
+        Bytes are decoded with ``errors="replace"``: a non-UTF-8 value is a
+        poisoned entry, not a fatal error. Raising here would escape the
+        cache's corrupt-entry handling and turn every matching search into
+        error 900 until the TTL expired, so invalid bytes decode to U+FFFD
+        instead. The caller's parse then fails, which drops the entry and
+        refetches upstream.
+        """
         raw = await self._redis.get(self._key(indexer, key))
         if raw is None:
             return None
         if isinstance(raw, bytes):
-            return raw.decode("utf-8")
+            return raw.decode("utf-8", errors="replace")
         return raw
 
     async def set(self, indexer: str, key: str, value: str, ttl: int | None) -> None:
@@ -62,3 +78,7 @@ class QueryCache:
         if effective_ttl <= 0:
             return
         await self._redis.set(self._key(indexer, key), value, ex=effective_ttl)
+
+    async def delete(self, indexer: str, key: str) -> None:
+        """Drop the cached response under ``(indexer, key)`` (best-effort)."""
+        await self._redis.delete(self._key(indexer, key))

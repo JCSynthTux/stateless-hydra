@@ -77,6 +77,7 @@ def create_app(
             resolve_indexer_key(indexer, api_keys),
             settings.user_agent,
             settings.global_proxy_url,
+            settings.max_upstream_body_bytes,
         )
         for indexer in indexer_list
     }

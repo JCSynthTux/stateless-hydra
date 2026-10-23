@@ -28,7 +28,23 @@ data:
     cache_ttl_seconds: 900
     dedupe_by_title: false
     max_results_per_indexer: 100
+
+    # Hard ceiling in bytes on a single upstream response (includes every
+    # redirect hop). Must be > 0; a larger response is abandoned (a search
+    # skips the indexer, details/NZB return Newznab error 900).
+    # max_upstream_body_bytes: 16777216
+
+    # Per-client UTC-daily envelopes over the shared per-indexer budgets. 0
+    # (default) = unlimited; a refused search answers 910, a download 930.
+    # per_client_api_hit_limit: 0
+    # per_client_nzb_pull_limit: 0
+
     global_proxy_url: null
 
     host: "0.0.0.0"
     port: 5076
+
+    # Optional fixed base for advertised download links (e.g. the ingress
+    # hostname); unset -> the request's Host header. Host-only value
+    # recommended: the request path (/api) is appended to it.
+    # public_base_url: "https://hydra.example.com"

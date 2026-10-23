@@ -15,6 +15,23 @@ Keys additionally expire at the *next* reset instant, and the expiry is written
 after every successful consume (not only when the counter is first created), so
 the operation is self-healing and a counter can never outlive its window.
 
+Two kinds of budget are tracked:
+
+* **Per-indexer** budgets (``api_hit_limit`` / ``nzb_pull_limit``) are keyed by
+  indexer and reset window.
+* **Per-client** envelopes (``per_client_api_hit_limit`` /
+  ``per_client_nzb_pull_limit``) are keyed by a SHA-256 digest of the presented
+  client API key and the UTC calendar date. They reset at UTC midnight, bound
+  how much of the shared per-indexer budget one client can consume, and never
+  store the raw key. A client envelope of ``0`` is unlimited and writes nothing.
+
+Consumption is atomic in the direction that matters: the counter is incremented
+first and compared afterwards, so it can never *end* a window above its limit. A
+rejected caller transiently raises the raw counter until its own ``DECR`` lands,
+so the counter can momentarily exceed the limit by the number of in-flight
+rejected callers and always settles back to the limit. See
+:meth:`LimitsManager._consume_key` for the details.
+
 Daylight-saving transitions: wall-clock reset times are resolved with
 :class:`zoneinfo.ZoneInfo` using its stdlib defaults (``fold=0``). A nonexistent
 local time (the spring-forward gap) resolves to the instant implied by the
@@ -28,6 +45,7 @@ only issues commands against it and never creates or closes connections.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -42,6 +60,8 @@ from .config import IndexerConfig
 logger = logging.getLogger(__name__)
 
 _KEY_PREFIX = "stateless_hydra:limits"
+# Per-client envelope keys: stateless_hydra:clientlimits:<sha256(apikey)>:<kind>:<date>
+_CLIENT_KEY_PREFIX = "stateless_hydra:clientlimits"
 
 
 class LimitKind(StrEnum):
@@ -146,6 +166,44 @@ class LimitsManager:
         window_date = _window_start(indexer, now).date().isoformat()
         return f"{_KEY_PREFIX}:{indexer.name}:{kind.value}:{window_date}"
 
+    @staticmethod
+    def _client_key(client: str, kind: LimitKind, now: datetime) -> str:
+        """Redis key for one client's envelope on the current UTC date.
+
+        The raw API key is never part of the key: only its SHA-256 digest is
+        used, so neither a Redis dump nor a ``KEYS`` listing can leak a client
+        secret. The date suffix scopes the envelope to a UTC calendar day.
+        """
+        digest = hashlib.sha256(client.encode()).hexdigest()
+        day = now.astimezone(UTC).date().isoformat()
+        return f"{_CLIENT_KEY_PREFIX}:{digest}:{kind.value}:{day}"
+
+    async def _consume_key(self, key: str, limit: int, reset_at: datetime) -> bool:
+        """``INCR``-then-compare one unit against ``key`` and report permission.
+
+        The counter is incremented first, so concurrent callers cannot all
+        observe the same pre-increment value: the stored count never *ends* a
+        window above ``limit``. A rejected call rolls its own increment back
+        with ``DECR``, but until that rollback lands the raw counter is
+        transiently ``limit + k``, where ``k`` is the number of in-flight
+        rejected callers. No extra hit is admitted, and the counter always
+        settles back to ``limit``.
+
+        ``limit == 0`` is unlimited: the call is always allowed but still
+        counted. ``EXPIREAT`` is (re)written on every consume (best-effort,
+        because a Redis hiccup must not fail the request) so a counter can
+        never outlive its window.
+        """
+        new_value = await self._redis.incr(key)
+        try:
+            await self._redis.expireat(key, int(reset_at.timestamp()))
+        except Exception:
+            logger.warning("failed to set expiry on limit key %s", key, exc_info=True)
+        if limit != 0 and new_value > limit:
+            await self._redis.decr(key)
+            return False
+        return True
+
     async def status(self, indexer_name: str, kind: LimitKind) -> LimitStatus:
         """Return the current budget status without consuming anything."""
         indexer = self._indexer(indexer_name)
@@ -165,42 +223,76 @@ class LimitsManager:
         return LimitStatus(allowed=used < limit, remaining=remaining, reset_at=reset_at)
 
     async def consume(self, indexer_name: str, kind: LimitKind) -> bool:
-        """Record one unit of usage and report whether it was allowed.
+        """Record one unit of an indexer's usage and report whether it was allowed.
 
-        Calls are allowed while ``used < limit`` (checked *before* incrementing),
-        so a request that would exceed the limit is rejected without being
-        counted. Unlimited indexers (``limit == 0``) are always allowed while
-        still counting usage for metrics.
+        A call that would exceed the limit is rejected and its increment rolled
+        back, so the stored count never ends a window above the limit (see
+        :meth:`_consume_key` for the transient overshoot while rejected callers'
+        rollbacks are in flight). Unlimited indexers
+        (``limit == 0``) are always allowed while still counting usage for
+        metrics.
 
         The counter key is scoped to the current reset window (see the module
         docstring), so crossing midnight does not start a new budget; only
-        reaching the indexer's reset time does. After every successful consume
-        the key's expiry is (re)set to the next reset instant via ``EXPIREAT``;
-        this is idempotent and self-heals any missing expiry.
-
-        Race note: the read-then-``INCR`` sequence is not atomic, so two
-        concurrent calls at the limit boundary can each observe ``used < limit``
-        and both increment, allowing one extra hit. This is benign for a
-        stateless proxy: the worst case is a single extra request per reset
-        window, and the repeated ``EXPIREAT`` keeps the key from outliving it.
+        reaching the indexer's reset time does. After every consume the key's
+        expiry is (re)set to the next reset instant via ``EXPIREAT``; this is
+        idempotent and self-heals any missing expiry.
         """
         indexer = self._indexer(indexer_name)
         limit = self._limit(indexer, kind)
         now = self._now()
-        key = self._key(indexer, kind, now)
+        return await self._consume_key(
+            self._key(indexer, kind, now), limit, next_reset(indexer, now)
+        )
 
-        # A corrupt (non-numeric) counter value raises here on purpose: that is
-        # an operational error worth surfacing rather than silently ignoring.
-        used = int(await self._redis.get(key) or 0)
-        if limit != 0 and used >= limit:
-            return False
+    async def consume_for_client(self, client: str, kind: LimitKind, limit: int) -> bool:
+        """Record one unit of a client's daily envelope and report whether allowed.
 
-        await self._redis.incr(key)
+        The envelope caps how much of the *shared* per-indexer budget a single
+        authenticated client may consume per UTC day, so one client can no
+        longer exhaust a shared budget and starve every peer until the
+        indexer's reset. Its key is
+        ``stateless_hydra:clientlimits:<sha256(client)>:<kind>:<UTC date>`` and
+        it expires at the next UTC midnight; the raw client key is never stored.
 
-        reset_at = next_reset(indexer, now)
-        try:
-            await self._redis.expireat(key, int(reset_at.timestamp()))
-        except Exception:
-            # Expiry is best-effort: a Redis hiccup must not fail the request.
-            logger.warning("failed to set expiry on limit key %s", key, exc_info=True)
-        return True
+        ``limit == 0`` disables the envelope: the call returns ``True`` without
+        reading or writing Redis, so behaviour is unchanged when unconfigured.
+        """
+        if limit < 0:
+            raise ValueError("per-client limit must be >= 0")
+        if limit == 0:
+            return True
+
+        now = self._now()
+        day = now.astimezone(UTC).date()
+        reset_at = datetime.combine(day + timedelta(days=1), time(0, 0), tzinfo=UTC)
+        return await self._consume_key(self._client_key(client, kind, now), limit, reset_at)
+
+    async def refund_for_client(self, client: str, kind: LimitKind, limit: int) -> None:
+        """Return one unit to a client's envelope after a later check denies.
+
+        The client envelope is charged *before* the indexer's shared budget, so
+        a request the indexer budget then refuses produced no upstream API hit
+        and must not cost the client quota: callers refund the unit here. The
+        counter is ``DECR``-ed with a floor of zero, so an already-empty or
+        missing envelope stays at zero (and no new key is created, which would
+        live on without the envelope's expiry).
+
+        ``limit == 0`` disables the envelope, so there is nothing to refund and
+        Redis is never touched. TTLs are left to :meth:`consume_for_client`:
+        ``DECR`` preserves the key's expiry.
+        """
+        if limit < 0:
+            raise ValueError("per-client limit must be >= 0")
+        if limit == 0:
+            return
+
+        key = self._client_key(client, kind, self._now())
+        # Reading first keeps a refund from *creating* the key: ``DECR`` on a
+        # missing key would store -1 (with no expiry) before the clamp below.
+        current = await self._redis.get(key)
+        if current is None or int(current) <= 0:
+            return
+        if await self._redis.decr(key) < 0:
+            # Two refunds raced past the read above; clamp back to the floor.
+            await self._redis.incr(key)

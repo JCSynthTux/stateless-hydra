@@ -8,8 +8,10 @@ services are required.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -25,6 +27,7 @@ from stateless_hydra.main import create_app
 
 API = "/api"
 KEY = "test-key"
+PEER_KEY = "peer-key"
 GEEK = "https://nzbgeek.example.com/api"
 SLUG = "https://slug.example.com/api"
 DETAILSURL = "https://detailsurl.example.com/api"
@@ -279,6 +282,64 @@ def test_search_items_carry_nzb_enclosure_pointing_at_our_getnzb(client, sample_
     assert "https://" not in params["id"]
     assert "r=" not in params["id"]
     assert "i=" not in params["id"]
+
+
+@respx.mock
+def test_download_links_use_configured_public_base_url(settings, fake_redis, sample_rss):
+    # A configured public base must win over the client-supplied Host header,
+    # which an attacker (or a caching intermediary) can choose freely.
+    respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+    respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
+    configured = settings.model_copy(update={"public_base_url": "https://hydra.example.com"})
+    public_app = create_app(configured, redis_client=fake_redis)
+
+    with TestClient(public_app) as public_client:
+        response = public_client.get(
+            API,
+            params={"t": "search", "q": "ubuntu", "apikey": KEY},
+            headers={"Host": "attacker.example"},
+        )
+
+    assert response.status_code == 200
+    items = _items(response.text)
+    assert items
+    assert "attacker.example" not in response.text
+    for item, enclosure in zip(items, _enclosures(response.text), strict=True):
+        assert enclosure is not None
+        assert enclosure.get("url").startswith("https://hydra.example.com/api?")
+        assert item.findtext("link").startswith("https://hydra.example.com/api?")
+        params = dict(httpx.URL(enclosure.get("url")).params)
+        assert params["t"] == "get"
+        assert params["apikey"] == KEY
+
+
+@respx.mock
+def test_download_links_with_path_bearing_public_base_have_no_double_slash(
+    settings, fake_redis, sample_rss
+):
+    # A path-bearing base (e.g. behind an ingress sub-path) is legal and must be
+    # used as-is: base + request path, never with an accidental double slash.
+    respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+    respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
+    configured = settings.model_copy(update={"public_base_url": "https://hydra.example.com/api"})
+    public_app = create_app(configured, redis_client=fake_redis)
+
+    with TestClient(public_app) as public_client:
+        response = public_client.get(API, params={"t": "search", "q": "ubuntu", "apikey": KEY})
+
+    assert response.status_code == 200
+    items = _items(response.text)
+    assert items
+    expected_prefix = "https://hydra.example.com/api/api?"
+    for item, enclosure in zip(items, _enclosures(response.text), strict=True):
+        assert enclosure is not None
+        url = enclosure.get("url")
+        assert url.startswith(expected_prefix)
+        assert "//" not in url.split("://", 1)[1]
+        assert item.findtext("link").startswith(expected_prefix)
+        params = dict(httpx.URL(url).params)
+        assert params["t"] == "get"
+        assert params["apikey"] == KEY
 
 
 @respx.mock
@@ -827,6 +888,127 @@ def test_malformed_upstream_response_is_not_cached(client, sample_rss):
     assert geek.call_count == 2
 
 
+@respx.mock
+async def test_separator_in_value_does_not_collide_with_two_params(
+    settings, fake_redis, sample_rss
+):
+    """A U+001F inside a value must not alias a two-parameter query.
+
+    Under the old separator-join preimage these two distinct queries hashed to
+    the same cache key, so the second was served the first's results.
+    """
+    app = create_app(settings, redis_client=fake_redis)
+    geek = respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
+        first = await ac.get(f"{API}?t=search&q=ubuntu&zzz=x%1Fzzzz=y&apikey={KEY}&indexer=nzbgeek")
+        second = await ac.get(
+            API,
+            params={
+                "t": "search",
+                "q": "ubuntu",
+                "zzz": "x",
+                "zzzz": "y",
+                "apikey": KEY,
+                "indexer": "nzbgeek",
+            },
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    # Distinct queries: the second made its own upstream call instead of being
+    # answered from the first's cache entry.
+    assert geek.call_count == 2
+    keys = await fake_redis.keys("stateless_hydra:cache:nzbgeek:*")
+    assert len(keys) == 2
+
+
+@respx.mock
+async def test_cache_write_failure_does_not_fail_search(
+    monkeypatch, settings, fake_redis, sample_rss
+):
+    """A Redis write error must not turn a successful upstream fetch into 900."""
+    app = create_app(settings, redis_client=fake_redis)
+    respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+
+    async def _fail(*args, **kwargs):
+        raise ConnectionError("redis write failed")
+
+    monkeypatch.setattr(fake_redis, "set", _fail)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
+        response = await ac.get(
+            API,
+            params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek"},
+        )
+
+    assert response.status_code == 200
+    assert 'code="900"' not in response.text
+    assert _guid_prefixes(response.text) == ["nzbgeek", "nzbgeek"]
+
+
+@respx.mock
+async def test_corrupt_cached_body_is_deleted_and_refetched(settings, fake_redis, sample_rss):
+    """A cached body that no longer parses is dropped instead of re-served."""
+    app = create_app(settings, redis_client=fake_redis)
+    geek = respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+    params = {"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek"}
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
+        first = await ac.get(API, params=params)
+        keys = await fake_redis.keys("stateless_hydra:cache:nzbgeek:*")
+        assert len(keys) == 1
+        await fake_redis.set(keys[0], "<rss><channel>")
+        # The refetch also returns an unparseable body, so nothing is re-cached
+        # and the poisoned key stays deleted.
+        geek.mock(return_value=httpx.Response(200, text="<rss><channel>"))
+        second = await ac.get(API, params=params)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    # The corrupt entry was not re-served: the request went upstream again.
+    assert geek.call_count == 2
+    assert await fake_redis.keys("stateless_hydra:cache:nzbgeek:*") == []
+
+
+@respx.mock
+async def test_non_utf8_cached_body_is_dropped_and_refetched(settings, fake_redis, sample_rss):
+    """A non-UTF-8 cache entry is a poisoned entry, not a fatal decode error.
+
+    Decoding used to raise ``UnicodeDecodeError`` outside the corrupt-cache
+    path, so one bad entry answered 900 for every matching search until its TTL
+    expired. It now decodes with replacement characters, fails the parse, and
+    flows into the delete-and-refetch branch like any other corrupt body.
+    """
+    app = create_app(settings, redis_client=fake_redis)
+    geek = respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+    params = {"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek"}
+    poisoned = b"\xff\xfe\x00<rss><channel>"  # invalid UTF-8 and unparseable
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
+        first = await ac.get(API, params=params)
+        assert first.status_code == 200
+        keys = await fake_redis.keys("stateless_hydra:cache:nzbgeek:*")
+        assert len(keys) == 1
+        await fake_redis.set(keys[0], poisoned)
+        second = await ac.get(API, params=params)
+        stored = await fake_redis.get(keys[0])
+
+    assert second.status_code == 200
+    assert 'code="900"' not in second.text
+    # The poisoned entry was dropped and the request went upstream again,
+    # serving a normal result set rather than an error.
+    assert geek.call_count == 2
+    assert _guid_prefixes(second.text) == ["nzbgeek", "nzbgeek"]
+    # The invalid bytes are gone: the fresh body replaced the poisoned value.
+    assert stored is not None
+    assert poisoned not in stored
+
+
 _UPSTREAM_ERROR_XML = (
     '<?xml version="1.0" encoding="UTF-8"?>\n'
     '<error code="203" description="Function not available"/>'
@@ -876,6 +1058,38 @@ def test_all_indexers_upstream_error_xml_yields_900(client):
     metrics = client.get("/metrics").text
     assert 'stateless_hydra_indexer_errors_total{indexer="nzbgeek"} 1.0' in metrics
     assert 'stateless_hydra_indexer_errors_total{indexer="slug"} 1.0' in metrics
+
+
+@respx.mock
+def test_oversized_upstream_search_body_is_skipped_not_500(settings, fake_redis):
+    """A body over the cap degrades to the normal indexer-failure mapping."""
+    capped_settings = settings.model_copy(update={"max_upstream_body_bytes": 64})
+    capped_app = create_app(capped_settings, redis_client=fake_redis)
+    respx.get(GEEK).mock(return_value=httpx.Response(200, text="<rss>" + "x" * 256))
+
+    with TestClient(capped_app) as capped_client:
+        response = capped_client.get(
+            API,
+            params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek"},
+        )
+
+    assert response.status_code == 200
+    # The indexer is skipped and the all-failed mapping (900) is returned; the
+    # oversized body never becomes a 500 or a partial feed.
+    assert 'code="900"' in response.text
+
+
+@respx.mock
+def test_over_item_limit_feed_is_skipped_not_500(client):
+    """`parse_indexer_rss` ValueError degrades to the indexer-error mapping."""
+    respx.get(GEEK).mock(return_value=httpx.Response(200, text=_paged_rss("geek", 1001)))
+
+    response = client.get(
+        API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek"}
+    )
+
+    assert response.status_code == 200
+    assert 'code="900"' in response.text
 
 
 @respx.mock
@@ -973,6 +1187,186 @@ def test_getnzb_disabled_indexer_yields_300_without_upstream(client):
     assert response.status_code == 200
     assert 'code="300"' in response.text
     assert ghost.call_count == 0
+
+
+# --- per-client daily envelopes ----------------------------------------------
+
+
+@respx.mock
+def test_per_client_api_hit_limit_skips_attacker_but_not_peer(settings, fake_redis, sample_rss):
+    """One client exhausting its daily envelope must not starve another.
+
+    ``per_client_api_hit_limit=2`` is exactly enough for both indexers on one
+    search, so the attacker's first search is served and its second is skipped
+    everywhere (910) without spending any indexer budget -- after which a peer's
+    identical search still reaches both indexers.
+    """
+    capped = settings.model_copy(update={"per_client_api_hit_limit": 2})
+    capped_app = create_app(capped, redis_client=fake_redis)
+    geek = respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+    slug = respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
+
+    with TestClient(capped_app) as capped_client:
+        first = capped_client.get(API, params={"t": "search", "q": "attacker-one", "apikey": KEY})
+        assert 'code="910"' not in first.text
+        assert (geek.call_count, slug.call_count) == (1, 1)
+
+        blocked = capped_client.get(API, params={"t": "search", "q": "attacker-two", "apikey": KEY})
+        assert 'code="910"' in blocked.text
+        # The skipped searches spent no upstream API hits at all.
+        assert (geek.call_count, slug.call_count) == (1, 1)
+
+        peer = capped_client.get(
+            API, params={"t": "search", "q": "attacker-two", "apikey": PEER_KEY}
+        )
+        assert 'code="910"' not in peer.text
+        assert (geek.call_count, slug.call_count) == (2, 2)
+
+
+@respx.mock
+def test_indexer_api_hit_limit_still_enforced_under_client_envelopes(
+    settings, fake_redis, sample_rss
+):
+    """Per-indexer budgets keep applying when clients are under their caps."""
+    capped = settings.model_copy(update={"per_client_api_hit_limit": 100})
+    capped_app = create_app(capped, redis_client=fake_redis)
+    geek = respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+    slug = respx.get(SLUG).mock(return_value=httpx.Response(200, text=_slug_rss(sample_rss)))
+
+    with TestClient(capped_app) as capped_client:
+        for query in ("one", "two", "three"):
+            response = capped_client.get(API, params={"t": "search", "q": query, "apikey": KEY})
+            assert response.status_code == 200
+
+    assert geek.call_count == 2  # nzbgeek's apiHitLimit
+    assert slug.call_count == 3  # slug is unlimited
+
+
+@respx.mock
+def test_per_client_nzb_pull_limit_refuses_attacker_but_not_peer(settings, fake_redis, sample_rss):
+    """An exhausted client NZB envelope yields 930 without spending a pull.
+
+    ``slug`` has ``nzbPullLimit: 0`` (unlimited), so the only thing that can
+    refuse a download here is the per-client envelope.
+    """
+    capped = settings.model_copy(update={"per_client_nzb_pull_limit": 1})
+    capped_app = create_app(capped, redis_client=fake_redis)
+    search_route = respx.get(SLUG, params={"t": "search"}).mock(
+        return_value=httpx.Response(200, text=_slug_rss(sample_rss))
+    )
+    download = respx.get(SLUG, params={"t": "getnzb"}).mock(
+        return_value=httpx.Response(200, content=b"fake-nzb")
+    )
+
+    with TestClient(capped_app) as capped_client:
+        search = capped_client.get(
+            API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "slug"}
+        )
+        assert 'code="910"' not in search.text
+        url = httpx.URL(_enclosures(search.text)[0].get("url"))
+
+        first = capped_client.get(url.path, params=dict(url.params))
+        assert first.status_code == 200
+        assert first.content == b"fake-nzb"
+
+        blocked = capped_client.get(url.path, params=dict(url.params))
+        assert blocked.status_code == 200
+        assert 'code="930"' in blocked.text
+        # A client-capped download never reaches the indexer.
+        assert download.call_count == 1
+
+        peer_params = {**dict(url.params), "apikey": PEER_KEY}
+        peer = capped_client.get(url.path, params=peer_params)
+        assert peer.status_code == 200
+        assert peer.content == b"fake-nzb"
+        assert download.call_count == 2
+        assert search_route.call_count == 1  # the peer's search was a cache hit
+
+
+@respx.mock
+def test_per_client_api_hit_limit_refuses_details_attacker_but_not_peer(settings, fake_redis):
+    """Repeated ``t=details`` calls are charged to the caller's API envelope.
+
+    ``slug`` has ``apiHitLimit: 0`` (unlimited), so only the per-client cap can
+    refuse the third call; it must answer 910 without any upstream request,
+    while a peer's identical call still reaches the indexer.
+    """
+    capped = settings.model_copy(update={"per_client_api_hit_limit": 2})
+    capped_app = create_app(capped, redis_client=fake_redis)
+    details = respx.get(SLUG, params={"t": "details", "id": "xyz"}).mock(
+        return_value=httpx.Response(200, text="<rss><channel/></rss>")
+    )
+
+    with TestClient(capped_app) as capped_client:
+        for _ in range(2):
+            response = capped_client.get(
+                API, params={"t": "details", "id": "slug:xyz", "apikey": KEY}
+            )
+            assert 'code="910"' not in response.text
+        assert details.call_count == 2
+
+        blocked = capped_client.get(API, params={"t": "details", "id": "slug:xyz", "apikey": KEY})
+        assert blocked.status_code == 200
+        assert 'code="910"' in blocked.text
+        # The refused call never reaches the indexer.
+        assert details.call_count == 2
+
+        peer = capped_client.get(API, params={"t": "details", "id": "slug:xyz", "apikey": PEER_KEY})
+        assert 'code="910"' not in peer.text
+        assert details.call_count == 3
+
+
+@respx.mock
+async def test_per_client_limits_default_to_no_redis_keys(settings, fake_redis, sample_rss):
+    """With both envelopes at their 0 default the feature is completely inert."""
+    app = create_app(settings, redis_client=fake_redis)
+    respx.get(GEEK, params={"t": "search"}).mock(return_value=httpx.Response(200, text=sample_rss))
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
+        response = await ac.get(
+            API, params={"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek"}
+        )
+
+    assert 'code="910"' not in response.text
+    assert await fake_redis.keys("stateless_hydra:clientlimits:*") == []
+
+
+@respx.mock
+async def test_exhausted_indexer_budget_refunds_the_client_api_envelope(
+    settings, fake_redis, sample_rss
+):
+    """A denial by the indexer budget gives the client's unit back.
+
+    ``per_client_api_hit_limit=5`` and ``nzbgeek``'s ``apiHitLimit: 2``: the
+    peer burns both indexer hits first, so the tested client's two attempts are
+    charged to its envelope and then refused by the indexer budget. Because no
+    attempt reached the indexer, both units are refunded and the client counter
+    stays at zero.
+    """
+    capped = settings.model_copy(update={"per_client_api_hit_limit": 5})
+    app = create_app(capped, redis_client=fake_redis)
+    geek = respx.get(GEEK).mock(return_value=httpx.Response(200, text=sample_rss))
+    params = {"t": "search", "q": "ubuntu", "apikey": KEY, "indexer": "nzbgeek"}
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
+        for query in ("peer-one", "peer-two"):
+            peer = await ac.get(API, params={**params, "q": query, "apikey": PEER_KEY})
+            assert 'code="910"' not in peer.text
+        assert geek.call_count == 2  # nzbgeek's apiHitLimit
+
+        for query in ("one", "two"):
+            blocked = await ac.get(API, params={**params, "q": query})
+            assert blocked.status_code == 200
+            assert 'code="910"' in blocked.text
+        # Neither refused attempt reached the indexer.
+        assert geek.call_count == 2
+
+    digest = hashlib.sha256(KEY.encode()).hexdigest()
+    day = datetime.now(UTC).date().isoformat()
+    client_key = f"stateless_hydra:clientlimits:{digest}:api:{day}"
+    assert int(await fake_redis.get(client_key) or 0) == 0
 
 
 def test_getnzb_missing_id_yields_200(client):
@@ -1079,7 +1473,7 @@ def test_search_response_never_leaks_upstream_url_or_indexer_key(client):
 def test_getnzb_direct_url_upstream_error_xml_is_not_streamed(client):
     # A 200 body that is actually a Newznab error document must surface as our
     # own error, never as an application/x-nzb stream.
-    url_guid = "https://api.althub.co.za/getnzb/abc.nzb&i=1&r=2"
+    url_guid = "https://nzbgeek.example.com/getnzb/abc.nzb&i=1&r=2"
     respx.get(url_guid).mock(
         return_value=httpx.Response(
             200,
@@ -1112,8 +1506,9 @@ def test_getnzb_unknown_token_yields_300(client):
 
 @respx.mock
 def test_getnzb_legacy_url_token_still_direct_fetches(client):
-    # A URL-shaped token is a pre-token guid; it must still be fetched directly.
-    url_guid = "https://api.althub.co.za/getnzb/legacy.nzb&i=9&r=8"
+    # A URL-shaped token is a pre-token guid; it must still be fetched directly
+    # when it sits on the owning indexer's own origin.
+    url_guid = "https://nzbgeek.example.com/getnzb/legacy.nzb&i=9&r=8"
     direct = respx.get(url_guid).mock(return_value=httpx.Response(200, content=b"legacy-nzb"))
 
     response = client.get(API, params={"t": "getnzb", "id": f"nzbgeek:{url_guid}", "apikey": KEY})
@@ -1125,6 +1520,110 @@ def test_getnzb_legacy_url_token_still_direct_fetches(client):
     filename = response.headers["content-disposition"]
     assert filename.startswith('attachment; filename="legacy.nzb')
     assert "&" not in filename
+
+
+@respx.mock
+def test_getnzb_foreign_host_legacy_url_is_rejected_without_upstream(client):
+    # Any hydra API-key holder can mint a URL-shaped token. Only the owning
+    # indexer's origin may be fetched, so a foreign host must never be contacted.
+    attacker = "https://attacker.invalid/steal"
+    foreign = respx.get(attacker).mock(return_value=httpx.Response(200, content=b"stolen"))
+    # The owning indexer must not be touched either: the token is not a search.
+    same = respx.get(GEEK).mock(return_value=httpx.Response(200, content=b"wrong"))
+
+    response = client.get(API, params={"t": "getnzb", "id": f"nzbgeek:{attacker}", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert 'code="300"' in response.text
+    assert "No such item" in response.text
+    assert foreign.call_count == 0
+    assert same.call_count == 0
+
+    # nzbgeek allows exactly one NZB pull; the rejected request must not have
+    # consumed it, so a legitimate download still succeeds.
+    legit = "https://nzbgeek.example.com/getnzb/budget.nzb"
+    allowed = respx.get(legit).mock(return_value=httpx.Response(200, content=b"budget-nzb"))
+
+    download = client.get(API, params={"t": "getnzb", "id": f"nzbgeek:{legit}", "apikey": KEY})
+
+    assert download.status_code == 200
+    assert download.content == b"budget-nzb"
+    assert allowed.call_count == 1
+    assert foreign.call_count == 0
+    assert same.call_count == 0
+
+
+@respx.mock
+def test_getnzb_same_origin_legacy_url_is_fetched(client):
+    url_guid = "https://nzbgeek.example.com/getnzb/same-origin.nzb&i=3&r=4"
+    direct = respx.get(url_guid).mock(return_value=httpx.Response(200, content=b"same-origin-nzb"))
+
+    response = client.get(API, params={"t": "getnzb", "id": f"nzbgeek:{url_guid}", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert response.content == b"same-origin-nzb"
+    assert response.headers["content-type"] == "application/x-nzb"
+    assert direct.call_count == 1
+
+
+@respx.mock
+def test_getnzb_cross_host_redirect_is_blocked(client):
+    # A same-origin URL that 302s to another host must not be followed; the
+    # request would otherwise still reach an arbitrary address.
+    start = "https://nzbgeek.example.com/getnzb/redirect.nzb"
+    redirect = respx.get(start).mock(
+        return_value=httpx.Response(302, headers={"location": "https://attacker.invalid/steal"})
+    )
+    attacker = respx.get("https://attacker.invalid/steal").mock(
+        return_value=httpx.Response(200, content=b"stolen")
+    )
+
+    response = client.get(API, params={"t": "getnzb", "id": f"nzbgeek:{start}", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert 'code="900"' in response.text
+    assert redirect.call_count == 1
+    assert attacker.call_count == 0
+
+
+@respx.mock
+def test_getnzb_signed_token_cross_host_redirect_is_blocked(client, settings):
+    # A deterministic token rebuilds its upstream URL from the signed guid, so
+    # the origin that matters is the derived one on the owning indexer -- not
+    # anything the client supplied. A 302 from there to a third host must not
+    # be followed.
+    derived = respx.get(GEEK, params={"t": "getnzb", "id": "guid-redirect"}).mock(
+        return_value=httpx.Response(302, headers={"location": "https://attacker.invalid/nzb"})
+    )
+    third = respx.get("https://attacker.invalid/nzb").mock(
+        return_value=httpx.Response(200, content=b"stolen")
+    )
+    token = tokens.sign(settings.nzb_token_signing_key, "nzbgeek", "guid-redirect")
+
+    response = client.get(API, params={"t": "getnzb", "id": f"nzbgeek:{token}", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert 'code="900"' in response.text
+    assert derived.call_count == 1
+    assert third.call_count == 0
+
+
+@respx.mock
+def test_getnzb_same_origin_redirect_is_followed(client):
+    start = "https://nzbgeek.example.com/getnzb/redirect.nzb"
+    target = "https://nzbgeek.example.com/getnzb/final.nzb"
+    first = respx.get(start).mock(
+        return_value=httpx.Response(302, headers={"location": "/getnzb/final.nzb"})
+    )
+    second = respx.get(target).mock(return_value=httpx.Response(200, content=b"redirected-nzb"))
+
+    response = client.get(API, params={"t": "getnzb", "id": f"nzbgeek:{start}", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert response.content == b"redirected-nzb"
+    assert response.headers["content-type"] == "application/x-nzb"
+    assert first.call_count == 1
+    assert second.call_count == 1
 
 
 @respx.mock
@@ -1443,6 +1942,22 @@ def test_details_is_proxied_verbatim(client):
     assert response.status_code == 200
     assert response.text == detail_xml
     assert response.headers["content-type"].startswith("application/xml")
+
+
+@respx.mock
+def test_details_cross_host_redirect_is_blocked(client):
+    respx.get(GEEK, params={"t": "details", "id": "xyz"}).mock(
+        return_value=httpx.Response(302, headers={"location": "https://attacker.invalid/details"})
+    )
+    attacker = respx.get("https://attacker.invalid/details").mock(
+        return_value=httpx.Response(200, text="<rss/>")
+    )
+
+    response = client.get(API, params={"t": "details", "id": "nzbgeek:xyz", "apikey": KEY})
+
+    assert response.status_code == 200
+    assert 'code="900"' in response.text
+    assert attacker.call_count == 0
 
 
 def test_details_unknown_indexer_yields_300(client):

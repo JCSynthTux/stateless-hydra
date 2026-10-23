@@ -19,6 +19,7 @@ import re
 import sys
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
@@ -26,10 +27,17 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .exceptions import ConfigError
+from .newznab import MAX_FEED_ITEMS
 
 # Minimum length required of the NZB token signing key. The key is HMAC key
 # material; a short/guessable key would let a client forge download tokens.
 _MIN_SIGNING_KEY_LENGTH = 32
+
+# Default ceiling for an upstream response body. A malicious or broken indexer
+# can stream arbitrarily many bytes; buffering them unbounded would let a few
+# large responses exhaust the pod's 256Mi memory limit. 16 MiB is generous for
+# a Newznab RSS page or an NZB payload while keeping the worst case bounded.
+DEFAULT_MAX_UPSTREAM_BODY_BYTES = 16 * 1024 * 1024
 
 # Default location of the YAML app configuration. Also the ``app_config`` field
 # default, kept as a module constant so ``load_settings`` can locate the file
@@ -38,6 +46,19 @@ _DEFAULT_APP_CONFIG = "/config/app.yaml"
 
 _VALID_SEARCH_TYPES = {"search", "tvsearch", "movie", "music", "book"}
 _RESET_TIME_PATTERN = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+# Placeholder prefix used by the shipped secret templates. Any api-keys value
+# that is this literal, or starts with it (``CHANGE_ME_BEFORE_DEPLOY``), is
+# rejected: the templates are public, so a service booted with an unreplaced
+# placeholder would accept a publicly known client API key. Matching is
+# case-insensitive, so ``change_me`` cannot slip through. Deliberately narrow:
+# short or "test"-style values are legitimate operator choices.
+_PLACEHOLDER_PREFIX = "CHANGE_ME"
+
+
+def _is_placeholder_secret(value: str) -> bool:
+    """Return True when ``value`` is a shipped-template placeholder."""
+    return value.strip().upper().startswith(_PLACEHOLDER_PREFIX)
 
 
 class ProxyConfig(BaseModel):
@@ -113,6 +134,41 @@ class ApiKeysFile(BaseModel):
     # environment variable overrides it (see resolve_nzb_token_signing_key).
     nzb_token_signing_key: str | None = Field(default=None, alias="nzbTokenSigningKey")
 
+    @field_validator("hydra_api_keys")
+    @classmethod
+    def _reject_placeholder_hydra_api_keys(cls, value: list[str]) -> list[str]:
+        """Refuse client API keys left at a shipped-template placeholder.
+
+        An unreplaced placeholder is public knowledge, so accepting it would
+        make the sole auth factor on ``/api`` trivially guessable.
+        """
+        offenders = [index for index, key in enumerate(value) if _is_placeholder_secret(key)]
+        if offenders:
+            raise ValueError(
+                "hydraApiKeys entries at index "
+                f"{offenders} are unreplaced placeholders ({_PLACEHOLDER_PREFIX}...); "
+                "replace every placeholder with a real random client API key"
+            )
+        return value
+
+    @field_validator("api_keys")
+    @classmethod
+    def _reject_placeholder_api_keys(cls, value: dict[str, str]) -> dict[str, str]:
+        """Refuse indexer API key values left at a shipped-template placeholder.
+
+        Only the values are secrets; the dict keys are ``apiKeyRef`` names.
+        Offending *refs* are reported rather than values so a real key is never
+        echoed into a startup error or the logs.
+        """
+        offenders = [ref for ref, key in value.items() if _is_placeholder_secret(key)]
+        if offenders:
+            raise ValueError(
+                "apiKeys values for refs "
+                f"{offenders} are unreplaced placeholders ({_PLACEHOLDER_PREFIX}...); "
+                "replace every placeholder with the real upstream indexer API key"
+            )
+        return value
+
 
 class AppSettings(BaseSettings):
     """Application-wide settings from YAML plus ``SH_*`` environment variables."""
@@ -125,9 +181,25 @@ class AppSettings(BaseSettings):
     cache_ttl_seconds: int = 900
     dedupe_by_title: bool = False
     max_results_per_indexer: int = 100
+    # Hard ceiling on bytes buffered from any single upstream response. Applies
+    # to every indexer search/details/NZB fetch (and every redirect hop).
+    max_upstream_body_bytes: int = DEFAULT_MAX_UPSTREAM_BODY_BYTES
+    # Per-client daily envelopes over the shared per-indexer budgets. 0 means
+    # unlimited (and writes no Redis keys). They reset at UTC midnight and are
+    # keyed by a hash of the presented client API key. Without them one
+    # authenticated client could burn a shared indexer budget for every peer.
+    per_client_api_hit_limit: int = Field(default=0, ge=0)
+    per_client_nzb_pull_limit: int = Field(default=0, ge=0)
     global_proxy_url: str | None = None
     host: str = "0.0.0.0"
     port: int = 5076
+    # Optional externally reachable base URL (e.g. the ingress hostname). When
+    # set, advertised download links are built from it instead of the request's
+    # Host header, which the client controls. Must be http(s) with a host and
+    # may carry a path; a query, fragment, userinfo, or invalid port would be
+    # spliced into every advertised link, so those are rejected. Trailing
+    # slashes are stripped so links are built as base + path.
+    public_base_url: str | None = None
     app_config: str = _DEFAULT_APP_CONFIG
     indexers_file: str = "/config/indexers.yaml"
     api_keys_file: str = "/config/api-keys.yaml"
@@ -145,6 +217,105 @@ class AppSettings(BaseSettings):
         # Store the stripped value: whitespace is not part of the key material,
         # and the length check below must agree with what tokens.py signs with.
         return value.strip()
+
+    @field_validator("max_results_per_indexer")
+    @classmethod
+    def _validate_max_results_per_indexer(cls, value: int) -> int:
+        # The feed parser refuses an upstream response with more than
+        # MAX_FEED_ITEMS items, so requesting more can only waste upstream
+        # quota: a compliant indexer's 1000-item page would be discarded whole
+        # and the search would degrade to the catch-up scale, not the requested
+        # count. Refuse the misconfiguration at startup instead.
+        if value < 1:
+            raise ValueError(
+                "max_results_per_indexer must be at least 1; set it via "
+                "SH_MAX_RESULTS_PER_INDEXER or the max_results_per_indexer field "
+                "in app.yaml"
+            )
+        if value > MAX_FEED_ITEMS:
+            raise ValueError(
+                f"max_results_per_indexer must not exceed the {MAX_FEED_ITEMS}-item "
+                "feed cap (the upstream feed parser refuses larger responses); set "
+                "it via SH_MAX_RESULTS_PER_INDEXER or the max_results_per_indexer "
+                "field in app.yaml"
+            )
+        return value
+
+    @field_validator("max_upstream_body_bytes")
+    @classmethod
+    def _validate_max_upstream_body_bytes(cls, value: int) -> int:
+        # A non-positive cap would reject every response (or disable the guard
+        # entirely, depending on the comparison), so refuse it at startup.
+        if value <= 0:
+            raise ValueError(
+                "max_upstream_body_bytes must be greater than 0; set it via "
+                "SH_MAX_UPSTREAM_BODY_BYTES or the max_upstream_body_bytes field "
+                "in app.yaml"
+            )
+        return value
+
+    @field_validator("public_base_url")
+    @classmethod
+    def _validate_public_base_url(cls, value: str | None) -> str | None:
+        # Links are built from this base, so it must be a well-formed absolute
+        # HTTP(S) URL. An empty value is treated as "unset"; whitespace is
+        # rejected rather than silently trimmed so a malformed value (e.g. a
+        # stray space or trailing junk) fails fast at startup instead of
+        # producing broken download links.
+        if not value:
+            return None
+        if any(char.isspace() for char in value):
+            raise ValueError(
+                "public_base_url must not contain whitespace; set it via "
+                "SH_PUBLIC_BASE_URL or the public_base_url field in app.yaml"
+            )
+        try:
+            parsed = urlsplit(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"public_base_url is not a valid URL: {value!r}; set it via "
+                "SH_PUBLIC_BASE_URL or the public_base_url field in app.yaml"
+            ) from exc
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError(
+                "public_base_url must be an absolute http:// or https:// URL "
+                "with a host (e.g. https://hydra.example.com); set it via "
+                "SH_PUBLIC_BASE_URL or the public_base_url field in app.yaml"
+            )
+        # ``netloc`` alone is not enough: ``https://:8080`` has one but no host
+        # at all, and links built from it would be unusable.
+        if not parsed.hostname:
+            raise ValueError(
+                "public_base_url must name a host, not just a port or userinfo "
+                "(e.g. https://hydra.example.com); set it via "
+                "SH_PUBLIC_BASE_URL or the public_base_url field in app.yaml"
+            )
+        # A query or fragment would be spliced verbatim into every advertised
+        # download link, so a base carrying one is a misconfiguration.
+        if parsed.query or parsed.fragment:
+            raise ValueError(
+                "public_base_url must not contain a query string or fragment; "
+                "set it via SH_PUBLIC_BASE_URL or the public_base_url field in "
+                "app.yaml"
+            )
+        # Credentials in the base would leak into every advertised link (and
+        # would not authenticate anything), so reject userinfo outright.
+        if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+            raise ValueError(
+                "public_base_url must not contain userinfo (user:password@); "
+                "set it via SH_PUBLIC_BASE_URL or the public_base_url field in "
+                "app.yaml"
+            )
+        # ``urlsplit`` accepts a non-numeric port; ``.port`` is what validates it
+        # and raises ValueError on garbage.
+        try:
+            _ = parsed.port
+        except ValueError as exc:
+            raise ValueError(
+                f"public_base_url has an invalid port: {value!r}; set it via "
+                "SH_PUBLIC_BASE_URL or the public_base_url field in app.yaml"
+            ) from exc
+        return value.rstrip("/")
 
     @model_validator(mode="after")
     def _validate_nzb_token_signing_key(self) -> AppSettings:

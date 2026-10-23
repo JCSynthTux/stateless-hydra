@@ -5,8 +5,10 @@ files under ``config/`` (which a later task owns).
 """
 
 import logging
+from pathlib import Path
 
 import pytest
+import yaml
 from fakeredis import aioredis
 
 from stateless_hydra.config import (
@@ -298,6 +300,122 @@ def test_missing_api_keys_file_raises_config_error(tmp_path):
         load_api_keys(str(tmp_path / "missing-api-keys.yaml"))
 
 
+# --- placeholder denylist (audit 4.2) ---------------------------------------
+#
+# The shipped secret templates are public, so an unreplaced CHANGE_ME value
+# would be a publicly known client API key (the only auth factor on /api).
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["CHANGE_ME", "CHANGE_ME_BEFORE_DEPLOY", "change_me", "Change_Me_1"],
+)
+def test_placeholder_hydra_api_key_is_rejected(tmp_path, value):
+    path = _write(tmp_path, "api-keys.yaml", f'hydraApiKeys:\n  - "{value}"\n')
+
+    with pytest.raises(ConfigError, match="hydraApiKeys"):
+        load_api_keys(path)
+
+
+def test_placeholder_api_key_value_is_rejected(tmp_path):
+    path = _write(
+        tmp_path,
+        "api-keys.yaml",
+        'apiKeys:\n  upstream: "CHANGE_ME_XYZ"\nhydraApiKeys:\n  - client-key-1\n',
+    )
+
+    with pytest.raises(ConfigError, match="apiKeys values for refs") as excinfo:
+        load_api_keys(path)
+    # The offending ref is named, the placeholder value itself need not be.
+    assert "upstream" in str(excinfo.value)
+
+
+def test_non_placeholder_short_and_real_looking_keys_load(tmp_path):
+    # The denylist must stay narrow: "test"-style and short operator keys are
+    # legitimate, only obvious shipped placeholders are refused.
+    path = _write(
+        tmp_path,
+        "api-keys.yaml",
+        'apiKeys:\n  upstream: "real-key-abc"\nhydraApiKeys:\n  - test\n',
+    )
+
+    api_keys = load_api_keys(path)
+
+    assert api_keys.api_keys == {"upstream": "real-key-abc"}
+    assert api_keys.hydra_api_keys == ["test"]
+
+
+_K8S_SECRET_TEMPLATE = Path(__file__).resolve().parents[1] / "k8s" / "secret-api-keys.yaml"
+_COMPOSE_API_KEYS_TEMPLATE = Path(__file__).resolve().parents[1] / "config" / "api-keys.yaml"
+
+
+def _k8s_template_api_keys_yaml() -> str:
+    """The api-keys.yaml embedded in the shipped Kubernetes Secret template."""
+    manifest = yaml.safe_load(_K8S_SECRET_TEMPLATE.read_text(encoding="utf-8"))
+    return manifest["stringData"]["api-keys.yaml"]
+
+
+@pytest.mark.parametrize("path", [_K8S_SECRET_TEMPLATE, _COMPOSE_API_KEYS_TEMPLATE])
+def test_shipped_templates_fail_closed_on_placeholders(tmp_path, path):
+    # Audit 4.2: booting either shipped template must be impossible until every
+    # placeholder is replaced, because the values are public.
+    text = _k8s_template_api_keys_yaml() if path == _K8S_SECRET_TEMPLATE else path.read_text()
+    data = yaml.safe_load(text)
+
+    assert data["hydraApiKeys"] == []
+    with pytest.raises(ConfigError, match="apiKeys values for refs"):
+        load_api_keys(_write(tmp_path, "api-keys.yaml", text))
+
+
+def test_k8s_secret_template_boots_only_after_all_placeholders_replaced(tmp_path):
+    # Replay the operator's edits in order and prove each remaining placeholder
+    # still blocks startup (signing key and hydraApiKeys are checked by
+    # create_app after the api-keys file validates).
+    template = _k8s_template_api_keys_yaml()
+    api_keys_path = tmp_path / "api-keys.yaml"
+    (tmp_path / "indexers.yaml").write_text("indexers: []\n", encoding="utf-8")
+
+    def settings(**overrides) -> AppSettings:
+        values = {
+            "indexers_file": str(tmp_path / "indexers.yaml"),
+            "api_keys_file": str(api_keys_path),
+            "log_level": "CRITICAL",
+            **overrides,
+        }
+        return AppSettings(**values)
+
+    # As shipped: the apiKeys placeholders are refused before anything boots.
+    api_keys_path.write_text(template, encoding="utf-8")
+    with pytest.raises(ConfigError, match="apiKeys values for refs"):
+        create_app(
+            settings(nzb_token_signing_key=_TEST_SIGNING_KEY),
+            redis_client=aioredis.FakeRedis(),
+        )
+
+    # Stage 1: real indexer keys, hydraApiKeys still empty -> still refused.
+    data = yaml.safe_load(template)
+    data["apiKeys"] = {"example_indexer_key": "real-indexer-key-1"}
+    api_keys_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    with pytest.raises(ConfigError, match="hydraApiKeys"):
+        create_app(
+            settings(nzb_token_signing_key=_TEST_SIGNING_KEY),
+            redis_client=aioredis.FakeRedis(),
+        )
+
+    # Stage 2: hydra key added, the shipped short signing key remains -> refused.
+    data["hydraApiKeys"] = ["real-client-key-1"]
+    api_keys_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    with pytest.raises(ConfigError, match="signing key"):
+        create_app(settings(), redis_client=aioredis.FakeRedis())
+
+    # Stage 3: every placeholder replaced -> boots.
+    data["nzbTokenSigningKey"] = _TEST_SIGNING_KEY
+    api_keys_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    app = create_app(settings(), redis_client=aioredis.FakeRedis())
+
+    assert app.state.hydra_api_keys == ["real-client-key-1"]
+
+
 # --- NZB signing key resolution ---------------------------------------------
 
 
@@ -358,10 +476,136 @@ def test_settings_defaults_when_nothing_set(tmp_path, monkeypatch):
     assert settings.cache_ttl_seconds == 900
     assert settings.dedupe_by_title is False
     assert settings.max_results_per_indexer == 100
+    assert settings.max_upstream_body_bytes == 16 * 1024 * 1024
     assert settings.global_proxy_url is None
     assert settings.host == "0.0.0.0"
     assert settings.port == 5076
+    assert settings.public_base_url is None
     assert settings.nzb_token_signing_key == _TEST_SIGNING_KEY
+
+
+def test_max_upstream_body_bytes_defaults_to_16_mib(tmp_path, monkeypatch):
+    _clear_sh_env(monkeypatch)
+
+    settings = load_settings(str(tmp_path / "missing-app.yaml"))
+
+    assert settings.max_upstream_body_bytes == 16 * 1024 * 1024
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_max_results_per_indexer_must_be_positive(tmp_path, monkeypatch, value):
+    _clear_sh_env(monkeypatch)
+    path = _write(tmp_path, "app.yaml", f"max_results_per_indexer: {value}\n")
+
+    with pytest.raises(ConfigError, match="max_results_per_indexer must be at least 1"):
+        load_settings(path)
+
+
+def test_max_results_per_indexer_rejects_values_over_feed_cap(tmp_path, monkeypatch):
+    # The feed parser refuses >1000-item responses, so a larger request would
+    # make every compliant indexer's page get discarded wholesale.
+    _clear_sh_env(monkeypatch)
+    path = _write(tmp_path, "app.yaml", "max_results_per_indexer: 1001\n")
+
+    with pytest.raises(ConfigError, match="1000-item feed cap"):
+        load_settings(path)
+
+
+@pytest.mark.parametrize("value", [1, 1000])
+def test_max_results_per_indexer_accepts_bounds(tmp_path, monkeypatch, value):
+    _clear_sh_env(monkeypatch)
+    path = _write(tmp_path, "app.yaml", f"max_results_per_indexer: {value}\n")
+
+    assert load_settings(path).max_results_per_indexer == value
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "-1048576"])
+def test_max_upstream_body_bytes_must_be_positive(tmp_path, monkeypatch, value):
+    _clear_sh_env(monkeypatch)
+    path = _write(tmp_path, "app.yaml", f"max_upstream_body_bytes: {value}\n")
+
+    with pytest.raises(ConfigError, match="max_upstream_body_bytes"):
+        load_settings(path)
+
+
+def test_max_upstream_body_bytes_loads_from_yaml(tmp_path, monkeypatch):
+    _clear_sh_env(monkeypatch)
+    path = _write(tmp_path, "app.yaml", "max_upstream_body_bytes: 1048576\n")
+
+    assert load_settings(path).max_upstream_body_bytes == 1048576
+
+
+def test_max_upstream_body_bytes_env_override_wins(tmp_path, monkeypatch):
+    _clear_sh_env(monkeypatch)
+    path = _write(tmp_path, "app.yaml", "max_upstream_body_bytes: 1048576\n")
+    monkeypatch.setenv("SH_MAX_UPSTREAM_BODY_BYTES", "2048")
+
+    assert load_settings(path).max_upstream_body_bytes == 2048
+
+
+def test_public_base_url_defaults_to_none(tmp_path, monkeypatch):
+    _clear_sh_env(monkeypatch)
+
+    assert load_settings(str(tmp_path / "missing-app.yaml")).public_base_url is None
+
+
+def test_public_base_url_strips_trailing_slash(tmp_path, monkeypatch):
+    _clear_sh_env(monkeypatch)
+    path = _write(tmp_path, "app.yaml", "public_base_url: https://hydra.example.com/\n")
+
+    assert load_settings(path).public_base_url == "https://hydra.example.com"
+
+
+def test_public_base_url_empty_means_unset(tmp_path, monkeypatch):
+    _clear_sh_env(monkeypatch)
+    path = _write(tmp_path, "app.yaml", 'public_base_url: ""\n')
+
+    assert load_settings(path).public_base_url is None
+
+
+def test_public_base_url_keeps_path_without_adding_or_removing_a_slash(tmp_path, monkeypatch):
+    _clear_sh_env(monkeypatch)
+    path = _write(tmp_path, "app.yaml", "public_base_url: https://hydra.example.com/api\n")
+
+    assert load_settings(path).public_base_url == "https://hydra.example.com/api"
+
+
+def test_public_base_url_env_override_wins(tmp_path, monkeypatch):
+    _clear_sh_env(monkeypatch)
+    path = _write(tmp_path, "app.yaml", "public_base_url: https://yaml.example.com\n")
+    monkeypatch.setenv("SH_PUBLIC_BASE_URL", "https://env.example.com/base")
+
+    assert load_settings(path).public_base_url == "https://env.example.com/base"
+
+
+def test_public_base_url_rejects_netloc_without_a_hostname():
+    # ``https://:8080`` has a non-empty netloc but no host at all; the netloc
+    # check alone would accept it and every advertised link would be broken.
+    with pytest.raises(ValueError, match="public_base_url"):
+        AppSettings(public_base_url="https://:8080")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "hydra.example.com",  # no scheme
+        "ftp://hydra.example.com",  # wrong scheme
+        "https://",  # no host
+        "https://:8080",  # port but no host
+        "https://hydra.example.com trailing",  # trailing junk
+        "https://hydra.example.com/ ",  # trailing whitespace
+        "https://h/base?x=1",  # query string
+        "https://h#f",  # fragment
+        "https://user:pass@h",  # userinfo
+        "https://h:badport/",  # non-numeric port
+    ],
+)
+def test_public_base_url_rejects_invalid_values(tmp_path, monkeypatch, value):
+    _clear_sh_env(monkeypatch)
+    path = _write(tmp_path, "app.yaml", f"public_base_url: {value!r}\n")
+
+    with pytest.raises(ConfigError, match="public_base_url"):
+        load_settings(path)
 
 
 def test_missing_nzb_token_signing_key_loads_then_resolve_raises(tmp_path, monkeypatch):

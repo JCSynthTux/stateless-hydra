@@ -41,6 +41,16 @@ ERROR_CODES: dict[int, str] = {
     940: "Download disabled",
 }
 
+# Hard ceilings applied to an upstream feed before it is materialized. A
+# hostile or broken indexer can return an enormous document; parsing it whole
+# (a 100k-item feed measured ~228 MiB) would exhaust the pod's 256Mi memory
+# limit. Oversized feeds are rejected with ``ValueError`` and degrade to a
+# skipped indexer rather than a 500. These are intentionally not configurable:
+# a Newznab page larger than 5 MiB or carrying more than 1000 items cannot be a
+# legitimate response to the paginated searches this proxy issues.
+MAX_FEED_BYTES = 5 * 1024 * 1024
+MAX_FEED_ITEMS = 1000
+
 # Standard Newznab/Torznab category table: ``id -> name``. An id divisible by
 # 1000 is a parent category; every other id is a subcategory of the parent with
 # the same thousands prefix. Names for subcategories include their parent path
@@ -235,6 +245,28 @@ _ERROR_ATTR = re.compile(
 )
 
 
+# Number of leading characters inspected when looking for an upstream error
+# document. A Newznab ``<error>`` element is tiny; bounding the prefix keeps a
+# hostile body from forcing a full decode/copy just to discover it is not one.
+_ERROR_INSPECT_CHARS = 4096
+
+
+def _xml_parser() -> etree.XMLParser:
+    """Return a hardened parser for untrusted indexer XML.
+
+    The posture is explicit rather than relying on lxml defaults: entities are
+    never resolved (no XXE/file reads), DTDs are not loaded, the parser never
+    touches the network, and ``huge_tree`` stays off so libxml's own depth/size
+    guards remain active. :data:`MAX_FEED_BYTES` bounds the input separately.
+    """
+    return etree.XMLParser(
+        resolve_entities=False,
+        load_dtd=False,
+        no_network=True,
+        huge_tree=False,
+    )
+
+
 def parse_upstream_error(body: bytes | str) -> tuple[int, str | None] | None:
     """Extract ``(code, description)`` from an upstream Newznab error document.
 
@@ -245,10 +277,15 @@ def parse_upstream_error(body: bytes | str) -> tuple[int, str | None] | None:
     the failure from clients, so callers inspect bodies with this function and
     re-raise the upstream error.
 
-    Returns ``None`` when ``body`` is not a Newznab error document. ``code``
-    is required; an unparseable code falls back to ``900``.
+    Only the first :data:`_ERROR_INSPECT_CHARS` characters are examined: the
+    root ``<error>`` element must appear at the start (optionally after an XML
+    declaration), so decoding and regexing the whole body would be wasted work
+    on every legitimate feed. Returns ``None`` when ``body`` is not a Newznab
+    error document. ``code`` is required; an unparseable code falls back to
+    ``900``.
     """
-    text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body
+    prefix = body[:_ERROR_INSPECT_CHARS]
+    text = prefix.decode("utf-8", errors="replace") if isinstance(prefix, bytes) else prefix
     stripped = text.lstrip()
     # Indexers commonly prepend an XML declaration (altHUB does), so tolerate
     # one before looking for the root ``<error>`` element.
@@ -539,10 +576,16 @@ def parse_indexer_rss(xml_text: str) -> ParsedRss:
     :attr:`ResultItem.attributes` (last value wins).
 
     Raises:
-        ValueError: if ``xml_text`` is not well-formed XML.
+        ValueError: if ``xml_text`` is not well-formed XML, exceeds
+            :data:`MAX_FEED_BYTES`, or contains more than
+            :data:`MAX_FEED_ITEMS` items. No partial result is returned for an
+            oversized feed.
     """
+    encoded = xml_text.encode("utf-8")
+    if len(encoded) > MAX_FEED_BYTES:
+        raise ValueError(f"indexer RSS exceeds {MAX_FEED_BYTES} bytes")
     try:
-        root = etree.fromstring(xml_text.encode("utf-8"))
+        root = etree.fromstring(encoded, parser=_xml_parser())
     except (etree.XMLSyntaxError, ValueError) as exc:
         raise ValueError(f"malformed indexer RSS XML: {exc}") from exc
 
@@ -560,7 +603,15 @@ def parse_indexer_rss(xml_text: str) -> ParsedRss:
         total = _int_or_none(response_el.get("total"))
         offset = _int_or_none(response_el.get("offset"))
 
-    items = [_parse_item(child) for child in channel if _local_name(child.tag) == "item"]
+    items: list[ResultItem] = []
+    for child in channel:
+        if _local_name(child.tag) != "item":
+            continue
+        # Check before materializing: the 1001st item is refused outright so a
+        # feed cannot grow the result list (and its memory) past the ceiling.
+        if len(items) >= MAX_FEED_ITEMS:
+            raise ValueError(f"indexer RSS exceeds {MAX_FEED_ITEMS} items")
+        items.append(_parse_item(child))
     return ParsedRss(items=items, total=total, offset=offset)
 
 

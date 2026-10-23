@@ -80,3 +80,18 @@ def test_cache_key_is_deterministic():
 
 def test_cache_key_differs_for_different_params():
     assert cache_key_for(("q=ubuntu",)) != cache_key_for(("q=debian",))
+
+
+def test_cache_key_value_cannot_imitate_tuple_boundary():
+    # A client-controlled value may contain the old U+001F separator; with a
+    # plain join, one value faked a pair boundary and collided with two pairs.
+    assert cache_key_for(("a=x\x1fy=b",)) != cache_key_for(("a=x", "y=b"))
+
+
+def test_cache_key_distinguishes_audit_twin_queries():
+    # The audit's twin queries: a literal U+001F inside one value versus the
+    # same bytes spread across two parameters.
+    first = ("zzz=x\x1fzzzz=y", "q=test", "t=search", "limit=10")
+    second = ("zzz=x", "q=test", "t=search", "limit=10", "zzzz=y")
+
+    assert cache_key_for(first) != cache_key_for(second)

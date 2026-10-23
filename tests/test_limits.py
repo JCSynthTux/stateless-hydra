@@ -11,7 +11,9 @@ the key). Assertions target specific keys rather than the whole keyspace, since
 old window keys legitimately linger until their expiry.
 """
 
-from datetime import UTC, date, datetime, timedelta
+import asyncio
+import hashlib
+from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -41,6 +43,11 @@ def _at(day_offset: int, hour: int, minute: int, tz=UTC) -> datetime:
 
 def _key(day: date, *, name: str = "ix", kind: str = "api") -> str:
     return f"stateless_hydra:limits:{name}:{kind}:{day.isoformat()}"
+
+
+def _client_key(client: str, kind: str, day: date) -> str:
+    digest = hashlib.sha256(client.encode()).hexdigest()
+    return f"stateless_hydra:clientlimits:{digest}:{kind}:{day.isoformat()}"
 
 
 def _manager(redis, indexers, now):
@@ -377,3 +384,213 @@ async def test_unlimited_key_still_gets_ttl(redis):
 
     key = await _only_key(redis)
     assert await redis.ttl(key) > 0
+
+
+# --- atomic consume (INCR-then-compare) --------------------------------------
+
+
+async def test_consume_beyond_limit_leaves_counter_exactly_at_limit(redis):
+    indexer = _indexer(api_hit_limit=2)
+    manager = _manager(redis, {indexer.name: indexer}, _at(0, 10, 0))
+
+    results = [await manager.consume(indexer.name, LimitKind.API) for _ in range(5)]
+
+    assert results == [True, True, False, False, False]
+    # Rejected calls rolled their own INCR back: no accumulated overshoot.
+    assert int(await redis.get(_key(_DAY))) == 2
+
+
+async def test_concurrent_consume_ends_exactly_at_limit(redis):
+    indexer = _indexer(api_hit_limit=2)
+    manager = _manager(redis, {indexer.name: indexer}, _at(0, 10, 0))
+
+    results = await asyncio.gather(
+        *(manager.consume(indexer.name, LimitKind.API) for _ in range(8))
+    )
+
+    assert sum(results) == 2
+    assert int(await redis.get(_key(_DAY))) == 2
+
+
+async def test_unlimited_consume_is_always_allowed_and_never_decremented(redis):
+    indexer = _indexer(api_hit_limit=0)
+    manager = _manager(redis, {indexer.name: indexer}, _at(0, 10, 0))
+
+    results = await asyncio.gather(
+        *(manager.consume(indexer.name, LimitKind.API) for _ in range(5))
+    )
+
+    assert all(results)
+    assert int(await redis.get(_key(_DAY))) == 5
+
+
+# --- per-client daily envelope -----------------------------------------------
+
+
+async def test_consume_for_client_caps_and_never_overshoots(redis):
+    manager = _manager(redis, {}, _at(0, 10, 0))
+    client = "attacker-key"
+
+    assert await manager.consume_for_client(client, LimitKind.API, 2) is True
+    assert await manager.consume_for_client(client, LimitKind.API, 2) is True
+    assert await manager.consume_for_client(client, LimitKind.API, 2) is False
+
+    assert int(await redis.get(_client_key(client, "api", _DAY))) == 2
+
+
+async def test_concurrent_consume_for_client_admits_exactly_limit(redis):
+    manager = _manager(redis, {}, _at(0, 10, 0))
+    client = "busy-client"
+
+    results = await asyncio.gather(
+        *(manager.consume_for_client(client, LimitKind.API, 3) for _ in range(10))
+    )
+
+    # Rejected callers may transiently raise the raw counter, but no extra hit
+    # is admitted and every DECR lands, so it settles back to the limit.
+    assert sum(results) == 3
+    assert int(await redis.get(_client_key(client, "api", _DAY))) == 3
+
+
+async def test_consume_for_client_caps_are_per_client(redis):
+    manager = _manager(redis, {}, _at(0, 10, 0))
+
+    assert await manager.consume_for_client("attacker", LimitKind.API, 1) is True
+    assert await manager.consume_for_client("attacker", LimitKind.API, 1) is False
+    # A different client keeps its own untouched envelope.
+    assert await manager.consume_for_client("peer", LimitKind.API, 1) is True
+
+
+async def test_consume_for_client_key_hashes_identity_and_uses_utc_date(redis):
+    # 10:00 on Kiritimati (UTC+14) is still the *previous* UTC day.
+    tz = ZoneInfo("Pacific/Kiritimati")
+    now = _at(0, 10, 0, tz=tz)
+    manager = _manager(redis, {}, now)
+    client = "super-secret-client-key"
+
+    assert await manager.consume_for_client(client, LimitKind.API, 5) is True
+
+    keys = [key.decode() for key in await redis.keys("*")]
+    assert keys == [_client_key(client, "api", _DAY - timedelta(days=1))]
+    # The raw credential never reaches Redis; only its SHA-256 digest does.
+    assert client not in keys[0]
+    assert hashlib.sha256(client.encode()).hexdigest() in keys[0]
+
+
+async def test_consume_for_client_zero_limit_short_circuits_without_redis(redis):
+    # A naive clock would raise if consulted: a 0 limit must not even look.
+    manager = LimitsManager(redis, {}, clock=lambda: datetime(2026, 10, 4, 10, 0))
+
+    assert await manager.consume_for_client("anyone", LimitKind.API, 0) is True
+    assert await manager.consume_for_client("anyone", LimitKind.NZB, 0) is True
+    assert await redis.keys("*") == []
+
+
+async def test_consume_for_client_rejects_negative_limit(redis):
+    manager = _manager(redis, {}, _at(0, 10, 0))
+
+    with pytest.raises(ValueError, match=">= 0"):
+        await manager.consume_for_client("anyone", LimitKind.API, -1)
+    assert await redis.keys("*") == []
+
+
+async def test_consume_for_client_is_independent_of_indexer_budget(redis):
+    indexer = _indexer(api_hit_limit=5)
+    manager = _manager(redis, {indexer.name: indexer}, _at(0, 10, 0))
+    client = "some-client"
+
+    assert await manager.consume_for_client(client, LimitKind.API, 1) is True
+    assert await manager.consume_for_client(client, LimitKind.API, 1) is False
+
+    # The per-indexer counter is untouched by client-envelope accounting.
+    assert not await _exists(redis, _key(_DAY))
+    assert await manager.consume(indexer.name, LimitKind.API) is True
+    assert int(await redis.get(_key(_DAY))) == 1
+    assert int(await redis.get(_client_key(client, "api", _DAY))) == 1
+
+
+async def test_consume_for_client_kind_separation(redis):
+    manager = _manager(redis, {}, _at(0, 10, 0))
+
+    assert await manager.consume_for_client("c", LimitKind.API, 1) is True
+    assert await manager.consume_for_client("c", LimitKind.API, 1) is False
+    assert await manager.consume_for_client("c", LimitKind.NZB, 1) is True
+
+
+async def test_consume_for_client_expires_at_next_utc_midnight(redis):
+    now = datetime.now(UTC)
+    manager = _manager(redis, {}, now)
+
+    assert await manager.consume_for_client("c", LimitKind.API, 5) is True
+
+    key = await _only_key(redis)
+    midnight = datetime.combine(now.date() + timedelta(days=1), time(0, 0), tzinfo=UTC)
+    expected = int(midnight.timestamp()) - int(now.timestamp())
+    ttl = await redis.ttl(key)
+
+    assert abs(ttl - expected) <= 5
+
+
+# --- per-client refunds ------------------------------------------------------
+
+
+async def test_refund_for_client_frees_the_unit_of_a_denied_indexer_hit(redis):
+    """Repeated indexer-budget denials must not drain the client envelope.
+
+    The client unit is charged first; when the indexer's own budget refuses the
+    request, no upstream API hit happens, so the unit is refunded. A client
+    hammering an exhausted indexer therefore keeps its full envelope.
+    """
+    indexer = _indexer(api_hit_limit=1)
+    manager = _manager(redis, {indexer.name: indexer}, _at(0, 10, 0))
+    client = "some-client"
+
+    # The one allowed hit consumes both the indexer budget and one client unit.
+    assert await manager.consume_for_client(client, LimitKind.API, 5) is True
+    assert await manager.consume(indexer.name, LimitKind.API) is True
+    assert int(await redis.get(_client_key(client, "api", _DAY))) == 1
+
+    for _ in range(5):
+        # The indexer budget now denies the request...
+        assert await manager.consume_for_client(client, LimitKind.API, 5) is True
+        assert await manager.consume(indexer.name, LimitKind.API) is False
+        # ...so the client unit is handed back.
+        await manager.refund_for_client(client, LimitKind.API, 5)
+
+    assert int(await redis.get(_client_key(client, "api", _DAY))) == 1
+
+
+async def test_refund_for_client_never_goes_below_zero(redis):
+    manager = _manager(redis, {}, _at(0, 10, 0))
+    client = "quiet-client"
+
+    assert await manager.consume_for_client(client, LimitKind.API, 1) is True
+    for _ in range(3):
+        await manager.refund_for_client(client, LimitKind.API, 1)
+
+    assert int(await redis.get(_client_key(client, "api", _DAY))) == 0
+
+
+async def test_refund_for_client_does_not_create_a_key(redis):
+    manager = _manager(redis, {}, _at(0, 10, 0))
+
+    await manager.refund_for_client("never-charged", LimitKind.API, 5)
+
+    # A refund of nothing must not leave an unexpiring zero counter behind.
+    assert await redis.keys("*") == []
+
+
+async def test_refund_for_client_zero_limit_short_circuits_without_redis(redis):
+    # A naive clock would raise if consulted: a 0 limit has nothing to refund.
+    manager = LimitsManager(redis, {}, clock=lambda: datetime(2026, 10, 4, 10, 0))
+
+    await manager.refund_for_client("anyone", LimitKind.API, 0)
+
+    assert await redis.keys("*") == []
+
+
+async def test_refund_for_client_rejects_negative_limit(redis):
+    manager = _manager(redis, {}, _at(0, 10, 0))
+
+    with pytest.raises(ValueError, match=">= 0"):
+        await manager.refund_for_client("anyone", LimitKind.NZB, -1)

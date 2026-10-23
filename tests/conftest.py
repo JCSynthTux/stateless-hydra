@@ -62,6 +62,7 @@ apiKeys:
   detailsurl_key: detailsurl-secret
 hydraApiKeys:
   - test-key
+  - peer-key
 """
 
 APP_YAML = """

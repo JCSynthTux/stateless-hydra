@@ -28,3 +28,6 @@ docker-compose.yml
 
 # Docs
 README.md
+
+# Local credentials: never copy a token file into the build context
+gh-token

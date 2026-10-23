@@ -13,6 +13,8 @@ from stateless_hydra.exceptions import StatelessHydraError
 from stateless_hydra.newznab import (
     CATEGORIES,
     ERROR_CODES,
+    MAX_FEED_BYTES,
+    MAX_FEED_ITEMS,
     NewznabError,
     ResultItem,
     canonical_query,
@@ -164,6 +166,17 @@ def test_parse_upstream_error_non_error_documents_return_none():
     assert parse_upstream_error("") is None
     # ``<error>`` without attributes is not a usable Newznab error document.
     assert parse_upstream_error("<error/>") is None
+
+
+def test_parse_upstream_error_ignores_error_beyond_inspect_prefix():
+    # Only the first 4096 characters are examined: an ``<error>`` buried past
+    # that bound in a large (1 MiB) body must not be mistaken for the document.
+    body = b" " * (1024 * 1024) + b'<error code="202" description="No such function"/>'
+
+    assert parse_upstream_error(body) is None
+    # The same document within the inspected prefix is still detected.
+    short = b" " * 100 + b'<error code="202" description="No such function"/>'
+    assert parse_upstream_error(short) == (202, "No such function")
 
 
 # --- render_caps ------------------------------------------------------------
@@ -624,6 +637,78 @@ def test_parse_render_parse_round_trip_preserves_items():
 def test_parse_indexer_rss_malformed_xml_raises_value_error():
     with pytest.raises(ValueError, match="malformed indexer RSS XML"):
         parse_indexer_rss("<rss><channel></rss>")
+
+
+# --- parse_indexer_rss caps and parser posture (audit 4.4 / hardening X2) ---
+
+
+def _feed_with_items(count: int) -> str:
+    items = "".join(
+        f"<item><title>t{index}</title><guid>g{index}</guid></item>" for index in range(count)
+    )
+    return f"<rss><channel>{items}</channel></rss>"
+
+
+def _feed_of_exact_size(size: int) -> str:
+    """A well-formed (empty) feed padded with whitespace to exactly ``size`` bytes."""
+    prefix = "<rss><channel>"
+    suffix = "</channel></rss>"
+    return prefix + " " * (size - len(prefix) - len(suffix)) + suffix
+
+
+def test_parse_indexer_rss_accepts_feed_exactly_at_byte_cap():
+    xml = _feed_of_exact_size(MAX_FEED_BYTES)
+
+    assert len(xml.encode("utf-8")) == MAX_FEED_BYTES
+    assert parse_indexer_rss(xml).items == []
+
+
+def test_parse_indexer_rss_rejects_feed_over_byte_cap():
+    xml = _feed_of_exact_size(MAX_FEED_BYTES + 1)
+
+    with pytest.raises(ValueError, match="bytes"):
+        parse_indexer_rss(xml)
+
+
+def test_parse_indexer_rss_accepts_max_items():
+    parsed = parse_indexer_rss(_feed_with_items(MAX_FEED_ITEMS))
+
+    assert len(parsed.items) == MAX_FEED_ITEMS
+
+
+def test_parse_indexer_rss_rejects_one_item_over_max():
+    with pytest.raises(ValueError, match="items"):
+        parse_indexer_rss(_feed_with_items(MAX_FEED_ITEMS + 1))
+
+
+def test_parse_indexer_rss_does_not_resolve_external_entities():
+    # Without resolve_entities=False/load_dtd=False/no_network=True this would
+    # read /etc/passwd into the item title (classic XXE). Assert that the text
+    # is not substituted: the unresolved reference leaves the title empty
+    # rather than merely "not containing root:".
+    xml = (
+        '<?xml version="1.0"?>'
+        '<!DOCTYPE rss [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>'
+        "<rss><channel><item><title>&xxe;</title><guid>g</guid></item>"
+        "</channel></rss>"
+    )
+
+    parsed = parse_indexer_rss(xml)
+
+    assert parsed.items[0].title == ""
+    assert "root:" not in parsed.items[0].title
+    assert "&xxe;" not in parsed.items[0].title
+
+
+def test_parse_indexer_rss_ignores_external_dtd_reference():
+    # load_dtd=False/no_network=True: a SYSTEM DTD reference is never fetched.
+    xml = (
+        '<?xml version="1.0"?>'
+        '<!DOCTYPE rss SYSTEM "http://127.0.0.1:1/unreachable.dtd">'
+        "<rss><channel/></rss>"
+    )
+
+    assert parse_indexer_rss(xml).items == []
 
 
 # --- canonical_query --------------------------------------------------------

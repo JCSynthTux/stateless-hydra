@@ -73,7 +73,9 @@ flowchart LR
 
 The repo ships `docker-compose.yml` plus example config in `config/`.
 
-1. Edit the example config files (all values are placeholders):
+1. Edit the example config files. The shipped `config/api-keys.yaml` is
+   fail-closed: every `CHANGE_ME` value, the empty `hydraApiKeys` list, and the
+   short signing key must be replaced before the app will boot.
    ```sh
    $EDITOR config/indexers.yaml   # add your indexers
    $EDITOR config/api-keys.yaml   # add real indexer keys + a hydra API key
@@ -116,12 +118,14 @@ kubectl apply -k k8s/
 
 Before doing so:
 
-1. Replace the placeholder values in `k8s/secret-api-keys.yaml` — the indexer
-   keys and the hydra client keys, and `nzbTokenSigningKey` (a random
-   ≥32-character secret for signing download tokens, a field inside the
+1. Fill in `k8s/secret-api-keys.yaml` — the two `apiKeys` values, at least one
+   real `hydraApiKeys` entry (the list ships empty), and `nzbTokenSigningKey` (a
+   random ≥32-character secret for signing download tokens, a field inside the
    secret's `api-keys.yaml`; generate one with `openssl rand -hex 32`) — or,
    better, manage that Secret with External Secrets, SOPS/sealed-secrets, or a
-   cloud secret manager. **Never commit real keys.**
+   cloud secret manager. The template is fail-closed: startup is refused while
+   a `CHANGE_ME` placeholder, an empty `hydraApiKeys` list, or a short signing
+   key remains. **Never commit real keys.**
 2. Replace the example indexers in `k8s/configmap-indexers.yaml`.
 3. Point Redis at your own endpoint by editing `redis_url` in
    `k8s/configmap-app.yaml` (the Service name in `k8s/redis.yaml` by default).
@@ -166,10 +170,14 @@ a value here (or `SH_NZB_TOKEN_SIGNING_KEY`) is an optional **override**.
 | `redis_url` | `redis://localhost:6379/0` | `SH_REDIS_URL` | Redis backing store URL. |
 | `cache_ttl_seconds` | `900` | `SH_CACHE_TTL_SECONDS` | Default search cache TTL; `0` disables caching. |
 | `dedupe_by_title` | `false` | `SH_DEDUPE_BY_TITLE` | Collapse identical titles across indexers. |
-| `max_results_per_indexer` | `100` | `SH_MAX_RESULTS_PER_INDEXER` | Max results requested per indexer. |
+| `max_results_per_indexer` | `100` | `SH_MAX_RESULTS_PER_INDEXER` | Max results requested per indexer. Must be `1`–`1000` (the feed parser's per-page cap); a higher value is rejected at startup. |
+| `max_upstream_body_bytes` | `16777216` (16 MiB) | `SH_MAX_UPSTREAM_BODY_BYTES` | Hard ceiling on bytes buffered from any single upstream response (searches, details and NZB payloads, including every redirect hop). Must be `> 0`. A larger response is abandoned: on a search the indexer is skipped; on details/getnzb it becomes Newznab error `900` (`Unknown error`). |
+| `per_client_api_hit_limit` | `0` | `SH_PER_CLIENT_API_HIT_LIMIT` | Daily per-client cap on indexer API hits, on top of the per-indexer budgets. `0` = unlimited. Must be `>= 0`. Counted per UTC day and keyed by a SHA-256 hash of the client's API key. When a client exhausts it, its searches skip every indexer (`910` when nothing else answers) without spending the indexer budget. See [How limits work](#how-limits-work). |
+| `per_client_nzb_pull_limit` | `0` | `SH_PER_CLIENT_NZB_PULL_LIMIT` | Daily per-client cap on NZB pulls, on top of the per-indexer budgets. `0` = unlimited. Must be `>= 0`. Exhausting it makes the client's `getnzb` return `930` without spending the indexer's pull budget. See [How limits work](#how-limits-work). |
 | `global_proxy_url` | unset | `SH_GLOBAL_PROXY_URL` | Default proxy for indexer requests: `http://`, `https://`, `socks5://` (or `socks5h://`). |
 | `host` | `0.0.0.0` | `SH_HOST` | Bind interface. |
 | `port` | `5076` | `SH_PORT` | Bind port (nzbhydra2's default). |
+| `public_base_url` | unset | `SH_PUBLIC_BASE_URL` | Optional externally reachable base URL, e.g. `https://hydra.example.com` behind an ingress. When set, advertised download links are built from it instead of the request's `Host` header, so a client cannot steer them. It is a URL **prefix**, not a full URL of this app: the request path (`/api`) is appended, so a path-bearing value such as `https://host/api` yields links like `https://host/api/api?...`. A host-only base is recommended (add a path prefix only when your ingress strips it). Must be an absolute `http://`/`https://` URL with a host; a query, fragment, userinfo, or invalid port is rejected. Trailing slashes are stripped. |
 | `app_config` | `/config/app.yaml` | `SH_APP_CONFIG` | Path to this file. |
 | `indexers_file` | `/config/indexers.yaml` | `SH_INDEXERS_FILE` | Path to the indexers file. |
 | `api_keys_file` | `/config/api-keys.yaml` | `SH_API_KEYS_FILE` | Path to the secrets file. |
@@ -222,12 +230,15 @@ limit of `0` means unlimited but usage is still counted for metrics.
 
 > **This file contains secrets. In production it is a Kubernetes Secret
 > mounted at `/config/api-keys.yaml`, and it must never be committed with real
-> values.** The checked-in copy has `CHANGE_ME` placeholders only.
+> values.** The checked-in copy has `CHANGE_ME` placeholders only, and those
+> placeholders intentionally fail startup: any `apiKeys` value that is
+> `CHANGE_ME` (or starts with it, case-insensitive) is rejected, and
+> `hydraApiKeys` ships empty. Replace every placeholder before booting.
 
 | Key | Shape | Description |
 | --- | --- | --- |
-| `apiKeys` | `{ref: "real-key"}` | Maps each indexer's `apiKeyRef` to its real API key. |
-| `hydraApiKeys` | `["key", ...]` | API keys clients present to `/api`. Must contain at least one entry (the app refuses to start otherwise). |
+| `apiKeys` | `{ref: "real-key"}` | Maps each indexer's `apiKeyRef` to its real API key. Values left at `CHANGE_ME` (or starting with it) are rejected at startup. |
+| `hydraApiKeys` | `["key", ...]` | API keys clients present to `/api` and the only authentication factor there. Must contain at least one entry (the app refuses to start otherwise); placeholder values are rejected. |
 | `nzbTokenSigningKey` | `"≥32-char secret"` | HMAC key that signs NZB download tokens. Required unless overridden by `nzb_token_signing_key`/`SH_NZB_TOKEN_SIGNING_KEY`; the app fails fast at startup if no source provides ≥32 characters. |
 
 In Kubernetes this Secret (`stateless-hydra-api-keys`) carries
@@ -254,6 +265,33 @@ every candidate indexer is out of API-hit budget, it responds with **`910`
 (API hit limit reached)**. Because the counters live in Redis, all replicas
 share one budget — adding pods does not multiply it.
 
+Those budgets are shared by every client, so an operator can additionally give
+each client its own daily envelope with `per_client_api_hit_limit` and
+`per_client_nzb_pull_limit` (`0`, the default, means unlimited and writes no
+keys). One unit is charged per upstream API hit (only a cache miss costs one)
+and per NZB pull served; a request the indexer's own budget then refuses is
+refunded, so the envelope counts only attempts that actually reached an
+indexer. The envelope resets at **00:00 UTC**, independently of the indexers'
+`resetTime`/`resetTimezone`, and its Redis key carries a SHA-256 digest of the
+client's API key rather than the key itself:
+
+```
+stateless_hydra:clientlimits:<sha256(apikey)>:<api|nzb>:<YYYY-MM-DD>
+```
+
+A client that is out of API hits has every indexer skipped for it exactly as if
+the indexers were exhausted (so a search with no other answer becomes `910`),
+and a client out of NZB pulls gets `930`. Crucially, the per-client check
+happens **before** the indexer budget is charged, so one noisy client cannot
+drain a shared budget and starve its peers until the indexer's reset.
+
+Limits are enforced by incrementing the counter first and comparing afterwards:
+a request over the limit rolls its own increment back, so the stored count never
+ends a window above the limit. The design admits exactly `limit` hits; a
+rejected caller transiently raises the raw counter until its own `DECR` lands,
+so the counter can momentarily exceed the limit by the number of in-flight
+rejected callers and always settles back to the limit. No extra hit is admitted.
+
 ## NZB download resolution
 
 A search result carries a **composed guid** of the form `INDEXER:TOKEN`. When a
@@ -272,6 +310,24 @@ guid:
   indexers such as drunkenSlug whose permalink `<link>` is the `.nzb` URL).
 - **Otherwise** → the download is rebuilt as
   `t=<downloadFunction>&id=<guid>` against the indexer's API.
+
+**Origin pinning.** Every download is fetched with a single pinned origin,
+`(scheme, authority)`: the owning indexer's configured `host` for the rebuilt
+path, and the guid's own scheme+authority for a URL-shaped guid fetched
+directly. Redirects during a download (and during a `t=details` fetch) are
+re-validated **per hop** against that pinned origin, so a hostile or
+compromised upstream cannot bounce the proxy onto another host; a cross-origin
+hop is refused and the request becomes Newznab error `900` (Unknown error).
+Each hop's body is also capped by `max_upstream_body_bytes`.
+
+**Advertised download links.** Every result's `<link>` and `<enclosure>` point
+back at this proxy's own `/api?t=get&id=…` URL. By default that URL is built
+from the request's `Host` header. Set `public_base_url` (for example your
+ingress hostname) to build it from a fixed configured base instead, so the
+links are independent of the client-supplied `Host` header — important in front
+of any caching intermediary. `public_base_url` is a URL **prefix**: the request
+path (`/api`) is appended, so keep it host-only (a value like
+`https://host/api` produces `https://host/api/api?...`).
 
 The token is derived per `(indexer, original guid)` with an HMAC-based
 encrypt-then-MAC construction keyed by the signing key (below), and is bound
@@ -297,8 +353,13 @@ again. This is intentional indexer-budget protection, not double-counting.
 
 **Backwards compatibility.** Download links minted by earlier versions — opaque
 tokens resolved through a Redis lookup with a 14-day TTL — remain valid until
-their original expiry. **Redis is not required for downloads** with the new
-tokens; it is still used for the search cache and the daily limits.
+their original expiry. Legacy URL-shaped ids (`t=getnzb&id=INDEXER:https://…`,
+issued before the opaque tokens) are honored **only** when the URL's scheme and
+authority equal the owning indexer's configured `host` (a port equal to the
+scheme's default is normalized away); any other id is refused with Newznab
+error `300` (No such item), so a hydra API key cannot turn the pod into an SSRF
+proxy. **Redis is not required for downloads** with the new tokens; it is still
+used for the search cache and the daily limits.
 
 **Known limits.** The token length grows with the guid, so a long URL-shaped
 guid yields a long download URL. Token lifetime is bucket-bound (about 1–2 days)
@@ -338,11 +399,21 @@ streaming HTML or an error body as a fake NZB.
 
 Search responses are cached in Redis keyed by the **normalized query** (the
 request parameters with `apikey` removed, values trimmed and pairs sorted, so
-parameter order does not matter). The TTL is the indexer's `cacheTtlSeconds`
+parameter order does not matter). The key is a SHA-256 digest of that normalized
+tuple serialized as JSON, so a parameter value can never imitate a tuple
+boundary. The TTL is the indexer's `cacheTtlSeconds`
 when set, otherwise the global `cache_ttl_seconds`; a non-positive TTL disables
 caching. The cache shortens indexer API usage, which is why it is a core part
 of the limits story. Clearing Redis is always safe: it only costs a cold cache
 and a reset of the current day's counters.
+
+Upstream responses are also bounded in memory. Each search/details/NZB fetch
+streams at most `max_upstream_body_bytes` (16 MiB by default, configurable) and
+is abandoned with an indexer error if it grows larger; a search feed is
+additionally refused when it exceeds **5 MiB** or contains more than **1000
+items**. Oversized feeds are therefore rejected (the indexer is skipped, or a
+Newznab error is returned on the download path) rather than buffered and parsed
+whole, which protects the pod's memory limit.
 
 ## Monitoring
 

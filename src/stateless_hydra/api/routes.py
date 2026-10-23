@@ -30,9 +30,9 @@ from fastapi import APIRouter, FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-from ..cache import cache_key_for
+from ..cache import QueryCache, cache_key_for
 from ..config import IndexerConfig
-from ..indexer_client import IndexerClient, IndexerError
+from ..indexer_client import IndexerClient, IndexerError, origin_of
 from ..limits import LimitKind
 from ..metrics import Metrics
 from ..newznab import (
@@ -234,6 +234,11 @@ def _download_url(request: Request, composed_guid: str) -> str:
     otherwise authenticate. It is the caller's own credential, never an indexer
     key.
 
+    The base comes from the configured ``public_base_url`` when set; otherwise
+    it is derived from the request's ``Host`` header (``request.base_url``).
+    The configured value is preferred behind an ingress/caching intermediary,
+    where a client-supplied Host must not be able to steer the advertised link.
+
     The function is advertised as the standard newznab ``t=get`` (with the
     release identity in ``id``) rather than ``t=getnzb``. AIOStreams identifies
     an NZB by hashing its URL: its ``hashNzbUrl`` knows the ``/api?t=get&id=...``
@@ -243,7 +248,7 @@ def _download_url(request: Request, composed_guid: str) -> str:
     selection and deduplication). ``get`` keeps each item's identity in the
     canonical hash; ``getnzb`` remains accepted server-side for older clients.
     """
-    base = str(request.base_url).rstrip("/")
+    base = request.app.state.settings.public_base_url or str(request.base_url).rstrip("/")
     apikey = request.query_params.get("apikey", "")
     query = urlencode({"t": "get", "id": composed_guid, "apikey": apikey})
     return f"{base}{request.url.path}?{query}"
@@ -297,6 +302,12 @@ async def _fetch_indexer_response(
     may run this concurrently across indexers. The second request is an
     additional API hit and is accounted against the same per-indexer budget,
     exactly like the first.
+
+    The caller's per-client envelope is charged *before* the indexer's own
+    budget: a client that is out of its daily share is skipped without
+    consuming the indexer budget its peers still draw from. When the indexer
+    budget is the one that refuses, the client's unit is refunded: its envelope
+    counts upstream hits that actually happened, not denied attempts.
     """
     app = request.app
     metrics = app.state.metrics
@@ -305,16 +316,35 @@ async def _fetch_indexer_response(
 
     cached = await app.state.cache.get(name, key)
     if cached is not None:
-        metrics.inc_cache_hit(name)
         parsed = _parse_or_none(name, cached, metrics)
-        if parsed is None:
-            return _UpstreamFetch(error_skipped=True)
-        return _UpstreamFetch(parsed=parsed)
+        if parsed is not None:
+            metrics.inc_cache_hit(name)
+            return _UpstreamFetch(parsed=parsed)
+        # A corrupt cached body must not be re-served (and re-fail) until its
+        # TTL expires: drop it and fall through to a fresh upstream fetch.
+        await _delete_cached(name, key, app.state.cache)
 
     metrics.inc_cache_miss(name)
+    client_allowed = await app.state.limits.consume_for_client(
+        request.state.apikey,
+        LimitKind.API,
+        app.state.settings.per_client_api_hit_limit,
+    )
+    if not client_allowed:
+        metrics.inc_limit_reached(name, LimitKind.API.value)
+        return _UpstreamFetch(limit_skipped=True)
+
     allowed = await app.state.limits.consume(name, LimitKind.API)
     await _update_limit_gauge(request, name, LimitKind.API)
     if not allowed:
+        # No upstream API hit happened, so give the client's envelope its unit
+        # back: the envelope counts successful hits, not denials by the shared
+        # per-indexer budget.
+        await app.state.limits.refund_for_client(
+            request.state.apikey,
+            LimitKind.API,
+            app.state.settings.per_client_api_hit_limit,
+        )
         metrics.inc_limit_reached(name, LimitKind.API.value)
         return _UpstreamFetch(limit_skipped=True)
 
@@ -331,8 +361,21 @@ async def _fetch_indexer_response(
     parsed = _parse_or_none(name, text, metrics)
     if parsed is None:
         return _UpstreamFetch(error_skipped=True)
-    await app.state.cache.set(name, key, text, cache_ttl)
+    # A cache write failure (Redis outage, OOM, ...) must not turn a successful
+    # upstream response into an error: the results are still valid to serve.
+    try:
+        await app.state.cache.set(name, key, text, cache_ttl)
+    except Exception:
+        logger.warning("indexer %s cache write failed", name, exc_info=True)
     return _UpstreamFetch(parsed=parsed)
+
+
+async def _delete_cached(name: str, key: str, cache: QueryCache) -> None:
+    """Best-effort removal of a poisoned cache entry; failures are only logged."""
+    try:
+        await cache.delete(name, key)
+    except Exception:
+        logger.warning("indexer %s cache delete failed", name, exc_info=True)
 
 
 async def _query_indexer(
@@ -602,16 +645,43 @@ async def _handle_details(request: Request) -> Response:
     if not _enabled_owner(request, indexer_name):
         raise NewznabError(300, "No such item")
     client = app.state.clients[indexer_name]
+    # Details is rebuilt against the configured host; hold any redirect to that
+    # same origin so a compromised/hostile upstream cannot bounce us elsewhere.
+    expected_origin = origin_of(app.state.indexers[indexer_name].host)
+
+    # Charge the caller's daily envelope before the indexer's shared budget: an
+    # exhausted client is refused with 910 (the same answer as an exhausted API
+    # budget) without spending a hit its peers could still use. Repeated
+    # ``t=details`` calls are otherwise an unthrottled way to exhaust an
+    # indexer's quota.
+    client_allowed = await app.state.limits.consume_for_client(
+        request.state.apikey,
+        LimitKind.API,
+        app.state.settings.per_client_api_hit_limit,
+    )
+    if not client_allowed:
+        metrics.inc_limit_reached(indexer_name, LimitKind.API.value)
+        raise NewznabError(910)
 
     allowed = await app.state.limits.consume(indexer_name, LimitKind.API)
     await _update_limit_gauge(request, indexer_name, LimitKind.API)
     if not allowed:
+        # Refund the client unit charged above: the indexer budget refused the
+        # request before any upstream hit, so the client must not pay for it.
+        await app.state.limits.refund_for_client(
+            request.state.apikey,
+            LimitKind.API,
+            app.state.settings.per_client_api_hit_limit,
+        )
         metrics.inc_limit_reached(indexer_name, LimitKind.API.value)
         raise NewznabError(910)
     metrics.inc_api_hit(indexer_name)
 
     try:
-        response = await client.fetch(client.build_url({"t": "details", "id": original_guid}))
+        response = await client.fetch(
+            client.build_url({"t": "details", "id": original_guid}),
+            expected_origin=expected_origin,
+        )
     except IndexerError:
         logger.warning("indexer %s details failed", indexer_name, exc_info=True)
         metrics.inc_error(indexer_name)
@@ -641,11 +711,17 @@ async def _handle_getnzb(request: Request) -> Response:
     indexer_name, token = split
     if not _enabled_owner(request, indexer_name):
         raise NewznabError(300, "No such item")
+    owner = app.state.indexers[indexer_name]
     client = app.state.clients[indexer_name]
 
     if token.startswith(("http://", "https://")):
         # Backward compatibility: guids issued before download tokens existed
-        # are upstream URLs (possibly carrying an indexer key). Fetch directly.
+        # are upstream URLs (possibly carrying an indexer key). They are
+        # client-supplied, so only a URL on the owning indexer's own origin is
+        # honored; anything else would let any hydra API-key holder turn this
+        # pod into an SSRF proxy against its in-cluster network position.
+        if origin_of(token) != origin_of(owner.host):
+            raise NewznabError(300, "No such item")
         upstream_url = token
     else:
         # New deterministic token: verify it for the indexer recovered from the
@@ -656,7 +732,6 @@ async def _handle_getnzb(request: Request) -> Response:
             request.app.state.settings.nzb_token_signing_key, indexer_name, token
         )
         if original_guid is not None:
-            owner = app.state.indexers[indexer_name]
             upstream_url = _derive_download_url(owner, client, original_guid)
         else:
             # Legacy: resolve the opaque token to the upstream URL stored at
@@ -668,15 +743,40 @@ async def _handle_getnzb(request: Request) -> Response:
             if not isinstance(upstream_url, str) or not upstream_url:
                 raise NewznabError(300, "No such item (download token expired or unknown)")
 
+    # Signed tokens rebuild a URL from an HMAC-covered guid, so its origin is the
+    # origin the indexer itself advertised; legacy stored URLs were written by a
+    # previous render. Either way the origin is known before the request, and
+    # redirects are held to it.
+    expected_origin = origin_of(upstream_url)
+
+    # Charge the caller's daily envelope before the indexer's shared budget: an
+    # exhausted client is refused with 930 (the same answer as an exhausted NZB
+    # budget) without spending a pull its peers could still use.
+    client_allowed = await app.state.limits.consume_for_client(
+        request.state.apikey,
+        LimitKind.NZB,
+        app.state.settings.per_client_nzb_pull_limit,
+    )
+    if not client_allowed:
+        metrics.inc_limit_reached(indexer_name, LimitKind.NZB.value)
+        raise NewznabError(930)
+
     allowed = await app.state.limits.consume(indexer_name, LimitKind.NZB)
     await _update_limit_gauge(request, indexer_name, LimitKind.NZB)
     if not allowed:
+        # Refund the client unit charged above: the indexer's pull budget
+        # refused the request before any upstream hit, so it costs no quota.
+        await app.state.limits.refund_for_client(
+            request.state.apikey,
+            LimitKind.NZB,
+            app.state.settings.per_client_nzb_pull_limit,
+        )
         metrics.inc_limit_reached(indexer_name, LimitKind.NZB.value)
         raise NewznabError(930)
     metrics.inc_nzb_pull(indexer_name)
 
     try:
-        response = await client.fetch(upstream_url)
+        response = await client.fetch(upstream_url, expected_origin=expected_origin)
     except IndexerError:
         logger.warning("indexer %s getnzb failed", indexer_name, exc_info=True)
         metrics.inc_error(indexer_name)
@@ -710,6 +810,9 @@ async def newznab_api(request: Request) -> Response:
         raise NewznabError(100, "Missing API key")
     if apikey not in request.app.state.hydra_api_keys:
         raise NewznabError(100, "Incorrect API key")
+    # Remember the verified client identity for the per-client daily envelopes
+    # charged by the search/getnzb handlers (only its hash is written to Redis).
+    request.state.apikey = apikey
 
     function = query.get("t")
     if not function:
